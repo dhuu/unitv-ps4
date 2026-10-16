@@ -1,0 +1,102 @@
+# UnitV Pro — PS4
+
+Versão para PlayStation 4 (homebrew) do app Android **UnitV Pro** (`com.willdev.unitvpro`).
+É um port em C++ que usa o [OpenOrbis PS4 Toolchain](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain),
+o SDL2 para desenhar a interface e o **libSceAvPlayer** (o player nativo do PS4) para tocar os vídeos.
+
+> **Requisito:** o PS4 precisa estar desbloqueado (GoldHEN ou outro HEN) para instalar pacotes `.pkg` fake-signed.
+
+## Funcionalidades (port do app Android)
+
+| Android | PS4 |
+|---|---|
+| `SplashActivity` + `get_config` do painel (DNS, logo, fundo, mensagem global) | `SplashScreen` |
+| `LoginActivity`: login por **MAC** (com verificação automática a cada 5 s) e por **usuário/senha** | `LoginScreen` (usa o MAC de rede do PS4) |
+| Fallback de DNS entre os servidores do painel (`DnsManager`) | `attemptLogin` |
+| TV ao vivo com categorias, lista de canais e EPG (`get_short_epg`) | `BrowseScreen` + zapping no player (Cima/Baixo, L1/R1) |
+| Filmes / Séries / Kids / Adultos (com senha parental, padrão `0000`) | `BrowseScreen` com grade de pôsteres |
+| Detalhes do filme (`get_vod_info`) e da série (`get_series_info`) com temporadas/episódios | `MovieDetailsScreen`, `SeriesDetailsScreen` |
+| Continuar de onde parou (Sim/Não) e próximo episódio | `startPlayback`, `PlayerScreen` |
+| Favoritos, histórico, busca | `SavedScreen`, `SearchScreen` |
+| Configurações: trocar DNS, senha parental, limpar histórico, recarregar listas, sair | `SettingsScreen` |
+
+A URL do painel fica em [`src/config.h`](src/config.h) (`PANEL_URL`), igual ao `DataRepository.kt` do Android.
+
+## Controles
+
+| Botão | Ação |
+|---|---|
+| **X** | Selecionar / Play-Pause |
+| **O** | Voltar |
+| **Quadrado** | Favoritar · próximo episódio (no player) |
+| **Triângulo** | Buscar · sinopse |
+| **L1 / R1** | Página anterior/próxima · trocar canal · ±1 min |
+| **← / →** (player) | ±10 s |
+| **L2 / R2** (player) | ±5 min |
+| **OPTIONS** | Ajustes |
+
+## Compilar no GitHub (recomendado)
+
+1. Crie um repositório no GitHub e envie **o conteúdo desta pasta** (`UnitVPro-PS4`) para a raiz dele.
+2. O workflow [`.github/workflows/build-ps4.yml`](.github/workflows/build-ps4.yml) roda sozinho a cada push:
+   baixa o OpenOrbis Toolchain, compila e gera o `.pkg`.
+3. Baixe o pacote em **Actions → (execução) → Artifacts → `UnitVPro-PS4-pkg`**.
+4. Para gerar uma *Release* com o `.pkg` anexado, crie uma tag: `git tag v1.0 && git push --tags`.
+
+## Compilar localmente (Linux/WSL)
+
+```bash
+# 1) Toolchain
+mkdir -p ~/oo && curl -sL https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain/releases/download/v0.5.4/toolchain-llvm-18.tar.gz | tar xz -C ~/oo
+export OO_PS4_TOOLCHAIN=~/oo/OpenOrbis/PS4Toolchain
+export DOTNET_ROLL_FORWARD=Major     # PkgTool.Core precisa de .NET
+
+# 2) Módulos do sistema
+mkdir -p sce_module sce_sys/about
+cp $OO_PS4_TOOLCHAIN/samples/hello_world/sce_module/*.prx sce_module/
+cp $OO_PS4_TOOLCHAIN/samples/hello_world/sce_sys/about/right.sprx sce_sys/about/
+
+# 3) Build (gera IV0000-UNTV00001_00-UNITVPROPS400000.pkg)
+make CCX=clang++-18 LD=ld.lld-18
+```
+
+## Instalar no PS4
+
+1. Copie o `.pkg` para um pendrive (FAT32/exFAT) ou use o *Remote Package Installer* / FTP do GoldHEN.
+2. No PS4: **Debug Settings → Game → Package Installer** (ou o instalador do GoldHEN).
+3. O app aparece na tela inicial como **UnitV Pro** (`UNTV00001`).
+
+Os dados (login, favoritos, histórico, progresso) ficam em `/data/UnitVPro/settings.json`.
+
+## Limitações conhecidas
+
+- O player do PS4 (AvPlayer) reproduz **HLS (`.m3u8`)** e **MP4 (H.264/AAC)**. Por isso a TV ao vivo usa
+  `.m3u8` por padrão. Dá para trocar para `.ts` em Ajustes, mas o AvPlayer pode não aceitar MPEG-TS direto.
+  Filmes em **MKV/AVI** ou com codecs HEVC/AC3 podem não tocar.
+- A conversão de vídeo NV12 → RGB é feita na CPU (renderizador por software do SDL). Conteúdo em 1080p60
+  pode descartar quadros.
+- O banner TMDB, a WebView de eventos e o player "mini" das telas de detalhes do Android não foram portados.
+- As estruturas do `libSceAvPlayer` não estão nos headers do OpenOrbis; foram declaradas em
+  [`src/avplayer_abi.h`](src/avplayer_abi.h) com base na documentação do emulador shadPS4.
+
+## Estrutura
+
+```
+src/
+  main.cpp            ponto de entrada
+  platform.*          módulos do sistema, MAC, arquivos
+  http.*              cliente HTTP/HTTPS (sceHttp)
+  json.*              parser JSON tolerante
+  api.*               API Xtream (player_api.php) + painel (api.php)
+  catalog.*           cache de categorias/streams
+  storage.*           configurações, favoritos, histórico e progresso
+  gfx.*               SDL2 + FreeType + carregamento assíncrono de imagens (stb_image)
+  input.*             controle DualShock 4
+  ime.*               teclado virtual do sistema
+  player.*            reprodutor (libSceAvPlayer + AudioOut)
+  ui.h / app.cpp      pilha de telas, diálogos, componentes
+  screens_*.cpp       telas
+assets/               fontes (DejaVu) e imagens
+sce_sys/              ícone (icon0.png) e fundo (pic1.png) do PS4
+third_party/          stb_image.h
+```
