@@ -37,6 +37,8 @@ void requirePin(std::function<void()> onSuccess);
 bool adultUnlocked();
 
 void run();    // laço principal
+// Pede um novo desenho da tela (a interface só redesenha quando algo muda)
+void redraw();
 void quit();
 
 // Branding vindo do painel (get_config)
@@ -49,8 +51,10 @@ Branding& branding();
 
 namespace ui {
 
-// Fundo padrão (imagem do painel ou bg_main.jpg) com escurecimento
+// Fundo padrão (imagem do painel ou bg_main.jpg) com escurecimento — composto uma vez e guardado em cache
 void background(uint8_t dim = 150);
+// Fundo de tela cheia a partir de uma imagem remota (detalhes de filme/série); cai no background() se faltar
+void backdrop(const std::string& url, uint8_t dim);
 // Barra superior com logo, título e relógio
 void header(const std::string& title, const std::string& subtitle = "");
 // Rodapé com dicas de botões, ex.: {{"X","Abrir"},{"O","Voltar"}}
@@ -61,7 +65,7 @@ void panel(int x, int y, int w, int h, Color c = col::panel);
 void focusFrame(int x, int y, int w, int h);
 // Imagem remota com fallback (retângulo + iniciais)
 void poster(const std::string& url, int x, int y, int w, int h, const std::string& fallbackText, bool cover = true);
-SDL_Texture* logo();
+SDL_Texture* logo(int size);
 
 // Lista vertical com rolagem
 struct ListNav {

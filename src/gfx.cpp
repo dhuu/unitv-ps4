@@ -320,12 +320,13 @@ int textWrapped(const std::string& s, int x, int y, int w, int size, Color c, in
     return n * lineH;
 }
 
-SDL_Texture* textureFromRGBA(const uint8_t* rgba, int w, int h)
+SDL_Texture* textureFromRGBA(const uint8_t* rgba, int w, int h, bool opaque)
 {
     SDL_Surface* s = SDL_CreateRGBSurfaceWithFormatFrom((void*)rgba, w, h, 32, w * 4, SDL_PIXELFORMAT_ABGR8888);
     if (!s) return nullptr;
     SDL_Texture* t = SDL_CreateTextureFromSurface(g_ren, s);
-    if (t) SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+    // imagens opacas sem mistura: cópia direta, bem mais rápida no renderizador por software
+    if (t) SDL_SetTextureBlendMode(t, opaque ? SDL_BLENDMODE_NONE : SDL_BLENDMODE_BLEND);
     SDL_FreeSurface(s);
     return t;
 }
@@ -335,7 +336,10 @@ SDL_Texture* loadTextureFile(const std::string& path)
     int w, h, n;
     uint8_t* px = stbi_load(path.c_str(), &w, &h, &n, 4);
     if (!px) return nullptr;
-    SDL_Texture* t = textureFromRGBA(px, w, h);
+    bool opaque = true;
+    for (size_t i = 3; i < (size_t)w * h * 4; i += 4)
+        if (px[i] != 255) { opaque = false; break; }
+    SDL_Texture* t = textureFromRGBA(px, w, h, opaque);
     stbi_image_free(px);
     return t;
 }
@@ -351,6 +355,7 @@ struct Decoded {
     std::string key;
     std::vector<uint8_t> rgba;
     int w = 0, h = 0;
+    bool opaque = true;
     bool failed = false;
 };
 
@@ -361,82 +366,95 @@ struct Entry {
     uint64_t lastUse = 0;
 };
 
+struct Job {
+    std::string key, url;
+    int w, h;
+    bool fit;
+};
+
 static std::unordered_map<std::string, Entry> g_cache;
-static std::deque<std::pair<std::string, std::pair<std::string, std::pair<int, int>>>> g_queue; // key,(url,(w,h))
+static std::deque<Job> g_queue;
 static std::vector<Decoded> g_done;
 static std::mutex g_mtx;
 static std::condition_variable g_cv;
-static const size_t kMaxTextures = 220;
+static const size_t kMaxTextures = 240;
 
-// Reduz a imagem para caber em maxW x maxH (média por caixa)
-static void downscale(const uint8_t* src, int sw, int sh, int maxW, int maxH, Decoded& out)
+// Reamostra a região (cx,cy,cw,ch) da origem para exatamente dw x dh (média por caixa).
+// Gerar a textura no tamanho final evita escala a cada quadro no renderizador por software.
+static void resample(const uint8_t* src, int sw, int cx, int cy, int cw, int ch, int dw, int dh, Decoded& out)
 {
-    double sc = 1.0;
-    if (sw > maxW || sh > maxH) {
-        double sx = (double)maxW / sw, sy = (double)maxH / sh;
-        sc = sx > sy ? sx : sy; // cobre a área (para drawTextureCover)
-        if (sc > 1.0) sc = 1.0;
-    }
-    int dw = (int)(sw * sc), dh = (int)(sh * sc);
-    if (dw < 1) dw = 1;
-    if (dh < 1) dh = 1;
     out.w = dw;
     out.h = dh;
     out.rgba.resize((size_t)dw * dh * 4);
-    if (dw == sw && dh == sh) { memcpy(out.rgba.data(), src, out.rgba.size()); return; }
+    out.opaque = true;
     for (int y = 0; y < dh; y++) {
-        int y0 = y * sh / dh, y1 = (y + 1) * sh / dh;
+        int y0 = cy + (int)((int64_t)y * ch / dh), y1 = cy + (int)((int64_t)(y + 1) * ch / dh);
         if (y1 <= y0) y1 = y0 + 1;
+        int ys = y1 - y0 > 3 ? (y1 - y0) / 3 : 1;
         for (int x = 0; x < dw; x++) {
-            int x0 = x * sw / dw, x1 = (x + 1) * sw / dw;
+            int x0 = cx + (int)((int64_t)x * cw / dw), x1 = cx + (int)((int64_t)(x + 1) * cw / dw);
             if (x1 <= x0) x1 = x0 + 1;
+            int xs = x1 - x0 > 3 ? (x1 - x0) / 3 : 1;
             unsigned acc[4] = {0, 0, 0, 0}, cnt = 0;
-            for (int yy = y0; yy < y1; yy += (y1 - y0 > 4 ? (y1 - y0) / 4 : 1))
-                for (int xx = x0; xx < x1; xx += (x1 - x0 > 4 ? (x1 - x0) / 4 : 1)) {
+            for (int yy = y0; yy < y1; yy += ys)
+                for (int xx = x0; xx < x1; xx += xs) {
                     const uint8_t* p = src + ((size_t)yy * sw + xx) * 4;
                     acc[0] += p[0]; acc[1] += p[1]; acc[2] += p[2]; acc[3] += p[3];
                     cnt++;
                 }
             uint8_t* d = &out.rgba[((size_t)y * dw + x) * 4];
             for (int k = 0; k < 4; k++) d[k] = (uint8_t)(acc[k] / cnt);
+            if (d[3] != 255) out.opaque = false;
         }
+    }
+}
+
+static void process(const uint8_t* px, int sw, int sh, const Job& j, Decoded& d)
+{
+    if (j.fit) {
+        // cabe inteiro em w x h mantendo proporção
+        int dw = j.w, dh = (int)((int64_t)sh * j.w / sw);
+        if (dh > j.h) { dh = j.h; dw = (int)((int64_t)sw * j.h / sh); }
+        if (dw < 1) dw = 1;
+        if (dh < 1) dh = 1;
+        resample(px, sw, 0, 0, sw, sh, dw, dh, d);
+    } else {
+        // preenche w x h exatamente, cortando o excesso (centro)
+        int cw = sw, ch = sh, cx = 0, cy = 0;
+        if ((int64_t)sw * j.h > (int64_t)sh * j.w) { cw = (int)((int64_t)sh * j.w / j.h); cx = (sw - cw) / 2; }
+        else { ch = (int)((int64_t)sw * j.h / j.w); cy = (sh - ch) / 2; }
+        if (cw < 1) cw = 1;
+        if (ch < 1) ch = 1;
+        resample(px, sw, cx, cy, cw, ch, j.w, j.h, d);
     }
 }
 
 static void worker()
 {
     for (;;) {
-        std::string key, url;
-        int mw, mh;
+        Job job;
         {
             std::unique_lock<std::mutex> lk(g_mtx);
             g_cv.wait(lk, [] { return !g_queue.empty(); });
-            auto job = g_queue.back(); // LIFO: itens visíveis mais recentes primeiro
+            job = g_queue.back(); // LIFO: itens visíveis mais recentes primeiro
             g_queue.pop_back();
-            key = job.first;
-            url = job.second.first;
-            mw = job.second.second.first;
-            mh = job.second.second.second;
         }
         Decoded d;
-        d.key = key;
+        d.key = job.key;
         std::string data;
         bool got = false;
-        if (util::startsWith(url, "/")) {
-            got = platform::readFile(url, data);
+        if (util::startsWith(job.url, "/")) {
+            got = platform::readFile(job.url, data);
         } else {
-            http::Response r = http::get(url, 12u << 20, 15);
+            http::Response r = http::get(job.url, 12u << 20, 15);
             got = r.ok();
             if (got) data.swap(r.body);
         }
         int w = 0, h = 0, n = 0;
         uint8_t* px = got ? stbi_load_from_memory((const uint8_t*)data.data(), (int)data.size(), &w, &h, &n, 4) : nullptr;
-        if (px) {
-            downscale(px, w, h, mw, mh, d);
-            stbi_image_free(px);
-        } else {
-            d.failed = true;
-        }
+        if (px && w > 0 && h > 0) process(px, w, h, job, d);
+        else d.failed = true;
+        if (px) stbi_image_free(px);
         std::lock_guard<std::mutex> lk(g_mtx);
         g_done.push_back(std::move(d));
     }
@@ -463,10 +481,10 @@ static void evict()
     }
 }
 
-SDL_Texture* get(const std::string& url, int maxW, int maxH)
+SDL_Texture* get(const std::string& url, int w, int h, bool fit)
 {
-    if (url.empty() || (!util::startsWith(url, "http") && !util::startsWith(url, "/"))) return nullptr;
-    std::string key = url + "#" + std::to_string(maxW) + "x" + std::to_string(maxH);
+    if (url.empty() || w <= 0 || h <= 0 || (!util::startsWith(url, "http") && !util::startsWith(url, "/"))) return nullptr;
+    std::string key = url + (fit ? "#f" : "#c") + std::to_string(w) + "x" + std::to_string(h);
     uint64_t now = platform::ticksMs();
     auto it = g_cache.find(key);
     if (it != g_cache.end()) {
@@ -479,11 +497,11 @@ SDL_Texture* get(const std::string& url, int maxW, int maxH)
     g_cache[key] = e;
     {
         std::lock_guard<std::mutex> lk(g_mtx);
-        g_queue.push_back({key, {url, {maxW, maxH}}});
+        g_queue.push_back({key, url, w, h, fit});
         if (g_queue.size() > 80) { // descarta pedidos antigos (já saíram da tela)
-            auto old = g_queue.front();
+            Job old = g_queue.front();
             g_queue.pop_front();
-            g_cache.erase(old.first);
+            g_cache.erase(old.key);
         }
     }
     g_cv.notify_one();
@@ -493,11 +511,11 @@ SDL_Texture* get(const std::string& url, int maxW, int maxH)
 void clearQueue()
 {
     std::lock_guard<std::mutex> lk(g_mtx);
-    for (auto& q : g_queue) g_cache.erase(q.first);
+    for (auto& q : g_queue) g_cache.erase(q.key);
     g_queue.clear();
 }
 
-void pump()
+int pump()
 {
     std::vector<Decoded> done;
     {
@@ -510,10 +528,11 @@ void pump()
         if (it == g_cache.end()) continue;
         it->second.pending = false;
         if (d.failed) { it->second.failed = true; continue; }
-        it->second.tex = gfx::textureFromRGBA(d.rgba.data(), d.w, d.h);
+        it->second.tex = gfx::textureFromRGBA(d.rgba.data(), d.w, d.h, d.opaque);
         created++;
     }
     if (created) evict();
+    return (int)done.size();
 }
 
 } // namespace images

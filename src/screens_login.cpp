@@ -305,7 +305,7 @@ public:
     void field(int x, int y, int w, const std::string& label, const std::string& value, bool focused, bool secret)
     {
         gfx::text(label, x, y, 24, col::dim);
-        gfx::fillRect(x, y + 34, w, 70, focused ? Color{40, 56, 100, 255} : Color{26, 30, 54, 240});
+        gfx::fillRect(x, y + 34, w, 70, focused ? Color{40, 56, 100, 255} : Color{26, 30, 54, 255});
         if (focused) gfx::drawRect(x - 3, y + 31, w + 6, 76, 3, col::accent);
         std::string v = value;
         if (secret && !v.empty()) v = std::string(value.size(), '*');
@@ -317,9 +317,9 @@ public:
     {
         ui::background(170);
         int px = 560, pw = 800, py = 140, ph = 800;
-        gfx::fillRect(px, py, pw, ph, {14, 18, 34, 230});
+        gfx::fillRect(px, py, pw, ph, {14, 18, 34, 255});
         gfx::fillRect(px, py, pw, 6, col::accent);
-        SDL_Texture* lg = ui::logo();
+        SDL_Texture* lg = ui::logo(160);
         if (lg) gfx::drawTextureFit(lg, px + pw / 2 - 80, py + 30, 160, 160);
         gfx::text(macMode_ ? "Login por MAC" : "Login com usuário e senha", px + pw / 2, py + 205, 34, col::text, true, 0,
                   Align::Center);

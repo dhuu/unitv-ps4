@@ -55,14 +55,16 @@ int textWrapped(const std::string& s, int x, int y, int w, int size, Color c, in
                 bool bold = false, int lineGap = 8);
 
 SDL_Texture* loadTextureFile(const std::string& path);
-SDL_Texture* textureFromRGBA(const uint8_t* rgba, int w, int h);
+SDL_Texture* textureFromRGBA(const uint8_t* rgba, int w, int h, bool opaque = false);
 
 } // namespace gfx
 
 namespace images {
-// Retorna a textura se já estiver carregada; caso contrário agenda o download e retorna nullptr.
-SDL_Texture* get(const std::string& url, int maxW, int maxH);
-void pump();        // chamar na thread principal a cada frame (cria texturas prontas)
+// Retorna a textura (já no tamanho final) se estiver carregada; senão agenda o download e retorna nullptr.
+// fit=false: exatamente w x h cortando o excesso; fit=true: cabe dentro de w x h mantendo proporção.
+// Aceita URL http(s) ou caminho local ("/app0/...").
+SDL_Texture* get(const std::string& url, int w, int h, bool fit = false);
+int pump();         // chamar na thread principal a cada frame; retorna quantas imagens terminaram
 void clearQueue();  // descarta pedidos pendentes (ao trocar de tela)
 void init();
 }

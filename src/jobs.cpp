@@ -53,7 +53,7 @@ void post(std::function<void()> fn)
     g_main.push_back(std::move(fn));
 }
 
-void pump()
+int pump()
 {
     std::vector<std::function<void()>> fns;
     {
@@ -61,6 +61,7 @@ void pump()
         fns.swap(g_main);
     }
     for (auto& f : fns) f();
+    return (int)fns.size();
 }
 
 } // namespace jobs

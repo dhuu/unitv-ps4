@@ -97,13 +97,7 @@ public:
     void render() override
     {
         std::string backdrop = !info_.backdrop.empty() ? info_.backdrop : (!info_.cover.empty() ? info_.cover : s_.icon);
-        SDL_Texture* bd = images::get(backdrop, SCREEN_W / 2, SCREEN_H / 2);
-        if (bd) {
-            gfx::drawTextureCover(bd, 0, 0, SCREEN_W, SCREEN_H);
-            gfx::fillRect(0, 0, SCREEN_W, SCREEN_H, {6, 8, 18, 190});
-        } else {
-            ui::background(200);
-        }
+        ui::backdrop(backdrop, 190);
         ui::header("Filmes", catalogName());
 
         int px = 120, py = 170, pw = 420, ph = 630;
@@ -233,13 +227,7 @@ public:
     void render() override
     {
         std::string backdrop = !info_.backdrop.empty() ? info_.backdrop : cover();
-        SDL_Texture* bd = images::get(backdrop, SCREEN_W / 2, SCREEN_H / 2);
-        if (bd) {
-            gfx::drawTextureCover(bd, 0, 0, SCREEN_W, SCREEN_H);
-            gfx::fillRect(0, 0, SCREEN_W, SCREEN_H, {6, 8, 18, 200});
-        } else {
-            ui::background(200);
-        }
+        ui::backdrop(backdrop, 200);
         ui::header("Séries", storage::isFavorite(Kind::Series, s_.id) ? "Nos seus favoritos" : "");
 
         int px = 100, py = 160, pw = 300, ph = 450;
@@ -267,7 +255,7 @@ public:
             int bw = gfx::textWidth(label, 24, true) + 40;
             if (tx + bw > x + w) break;
             bool sel = i == season_;
-            gfx::fillRect(tx, ty, bw, 56, sel ? (focus_ == 0 ? col::accent : Color{40, 50, 90, 255}) : Color{24, 28, 50, 220});
+            gfx::fillRect(tx, ty, bw, 56, sel ? (focus_ == 0 ? col::accent : Color{40, 50, 90, 255}) : Color{24, 28, 50, 255});
             gfx::text(label, tx + bw / 2, ty + 14, 24, col::white, sel, 0, Align::Center);
             tx += bw + 12;
         }
@@ -284,7 +272,7 @@ public:
                 const Episode& e = (*eps)[(size_t)i];
                 int ry = ey + (i - epNav_.top) * rh;
                 bool sel = i == epNav_.sel && focus_ == 1;
-                gfx::fillRect(x, ry, w, rh - 10, sel ? Color{0, 110, 190, 235} : Color{18, 22, 40, 215});
+                gfx::fillRect(x, ry, w, rh - 10, sel ? Color{0, 110, 190, 255} : Color{18, 22, 40, 255});
                 ui::poster(e.image.empty() ? cover() : e.image, x + 8, ry + 8, 160, rh - 26, e.title);
                 char num[32];
                 snprintf(num, sizeof(num), "Episódio %d", e.num);

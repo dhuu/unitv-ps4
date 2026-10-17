@@ -182,6 +182,7 @@ public:
 
     void setActive(int i)
     {
+        app::redraw();
         activeCat_ = i;
         listNav_ = ui::ListNav();
         gridNav_ = ui::GridNav();
@@ -219,7 +220,7 @@ public:
     void renderCategories()
     {
         int x = 40, y = 150, w = 450, rh = 60;
-        gfx::fillRect(x, y - 10, w, kCatVisible * rh + 20, {10, 12, 24, 200});
+        gfx::fillRect(x, y - 10, w, kCatVisible * rh + 20, {10, 12, 24, 255});
         int n = (int)cats_.size();
         if (n == 0) {
             gfx::textWrapped("Nenhuma categoria disponível.", x + 20, y + 20, w - 40, 26, col::dim);
@@ -264,7 +265,7 @@ public:
     void renderLive(const std::vector<Stream>* list, catalog::Load st)
     {
         int x = 530, y = 150, w = 700, rh = 66;
-        gfx::fillRect(x, y - 10, w, kChanVisible * rh + 20, {10, 12, 24, 200});
+        gfx::fillRect(x, y - 10, w, kChanVisible * rh + 20, {10, 12, 24, 255});
         if (!list || list->empty()) { renderLoading(st, x + w / 2, y + 300); return; }
         int n = (int)list->size();
         listNav_.clamp(n, kChanVisible);
@@ -282,7 +283,7 @@ public:
 
         // painel de pré-visualização com EPG
         int px = 1260, pw = SCREEN_W - px - 40;
-        gfx::fillRect(px, y - 10, pw, kChanVisible * rh + 20, {10, 12, 24, 210});
+        gfx::fillRect(px, y - 10, pw, kChanVisible * rh + 20, {10, 12, 24, 255});
         const Stream& cur = (*list)[(size_t)listNav_.sel];
         ui::poster(cur.icon, px + 30, y + 20, pw - 60, 260, cur.name, false);
         gfx::text(cur.name, px + 30, y + 310, 32, col::text, true, pw - 60);
@@ -321,7 +322,7 @@ public:
                 if (i >= n) break;
                 const Stream& s = (*list)[(size_t)i];
                 int x = x0 + c * (pw + gapX), y = y0 + r * (ph + gapY);
-                if (r == kGridRows) { images::get(s.icon, pw, ph); continue; } // só pré-carrega
+                if (r == kGridRows) { images::get(s.icon, pw, ph); continue; } // só pré-carrega (mesmo tamanho do poster)
                 ui::poster(s.icon, x, y, pw, ph, s.name);
                 if (!s.rating.empty() && s.rating != "0") {
                     gfx::fillRect(x + pw - 70, y + 8, 62, 30, {0, 0, 0, 190});

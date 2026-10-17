@@ -58,7 +58,6 @@ class HomeScreen : public Screen {
     };
     std::vector<Tile> tiles_;
     int sel_ = 0;
-    std::vector<SDL_Texture*> tex_;
     bool shownMsg_ = false;
 
 public:
@@ -89,13 +88,7 @@ public:
             {"AJUSTES", "Conta, DNS e senha", {90, 100, 120, 255}, {40, 44, 60, 255}, "",
              [] { app::push(makeSettings()); }},
         };
-        for (auto& t : tiles_)
-            tex_.push_back(t.image.empty() ? nullptr : gfx::loadTextureFile(std::string(APP_ASSETS "/images/") + t.image));
-    }
 
-    ~HomeScreen() override
-    {
-        for (auto* t : tex_) if (t) SDL_DestroyTexture(t);
     }
 
     void enter() override
@@ -148,7 +141,10 @@ public:
             int x = x0 + c * (tw + gap), y = y0 + r * (th + gap + 10);
             const Tile& t = tiles_[i];
             gfx::fillGradientV(x, y, tw, th, t.c1, t.c2);
-            if (tex_[i]) gfx::drawTextureCover(tex_[i], x, y, tw, th, 230);
+            if (!t.image.empty()) {
+                SDL_Texture* img = images::get(std::string(APP_ASSETS "/images/") + t.image, tw, th);
+                if (img) gfx::drawTexture(img, x, y, tw, th);
+            }
             gfx::fillGradientV(x, y + th - 130, tw, 130, {0, 0, 0, 0}, {0, 0, 0, 200});
             gfx::text(t.label, x + 22, y + th - 96, 36, col::white, true, tw - 40);
             gfx::text(t.sub, x + 22, y + th - 48, 22, {220, 225, 240, 255}, false, tw - 40);
@@ -460,7 +456,7 @@ public:
         for (int i = 0; i < (int)r.size(); i++) {
             int y = y0 + i * (rh + 6);
             bool f = i == nav_.sel;
-            gfx::fillRect(x, y, w, rh, f ? Color{0, 120, 200, 235} : Color{20, 24, 44, 220});
+            gfx::fillRect(x, y, w, rh, f ? Color{0, 120, 200, 255} : Color{20, 24, 44, 255});
             gfx::text(r[(size_t)i].label, x + 30, y + 20, 28, col::text, f);
             gfx::text(r[(size_t)i].value, x + w - 30, y + 22, 26, f ? col::white : col::dim, false, w / 2, Align::Right);
         }

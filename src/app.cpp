@@ -18,6 +18,9 @@ static bool g_running = true;
 static bool g_needEnter = false;
 static Branding g_branding;
 static bool g_adultUnlocked = false;
+static bool g_dirty = true;
+
+void redraw() { g_dirty = true; }
 
 struct Toast {
     std::string msg;
@@ -60,6 +63,7 @@ void toast(const std::string& msg)
 {
     g_toast.msg = msg;
     g_toast.until = platform::ticksMs() + 3200;
+    g_dirty = true;
 }
 
 void dialog(const std::string& title, const std::string& msg, const std::vector<std::string>& buttons,
@@ -71,6 +75,7 @@ void dialog(const std::string& title, const std::string& msg, const std::vector<
     d.buttons = buttons.empty() ? std::vector<std::string>{"OK"} : buttons;
     d.cb = std::move(cb);
     g_dialogs.push_back(std::move(d));
+    g_dirty = true;
 }
 
 void message(const std::string& title, const std::string& msg) { dialog(title, msg, {"OK"}); }
@@ -134,18 +139,24 @@ static void handleDialogInput(Btn b)
 
 void run()
 {
+    uint64_t lastDraw = 0;
+    bool toastWasVisible = false;
+    bool imeWasActive = false;
     while (g_running) {
         uint64_t frameStart = platform::ticksMs();
-        jobs::pump();
-        images::pump();
+        if (jobs::pump()) g_dirty = true;
+        if (images::pump()) g_dirty = true;
         ime::update();
+        if (ime::active() != imeWasActive) { imeWasActive = ime::active(); g_dirty = true; }
 
         if (g_needEnter && !g_stack.empty()) {
             g_needEnter = false;
             g_stack.back()->enter();
+            g_dirty = true;
         }
 
         std::vector<Btn> btns = input::poll();
+        if (!btns.empty()) g_dirty = true;
         if (!ime::active()) {
             for (Btn b : btns) {
                 if (!g_dialogs.empty()) handleDialogInput(b);
@@ -157,6 +168,19 @@ void run()
         if (g_stack.empty()) break;
         Screen* top = g_stack.back().get();
         top->update();
+
+        uint64_t now0 = platform::ticksMs();
+        bool toastVisible = now0 < g_toast.until && !g_toast.msg.empty();
+        if (toastVisible != toastWasVisible) { toastWasVisible = toastVisible; g_dirty = true; }
+        // Renderização por software é cara: só redesenha quando algo mudou (ou o vídeo/relógio pede)
+        bool draw = g_dirty || top->drawsVideo() || now0 - lastDraw >= 1000;
+        if (!draw) {
+            g_graveyard.clear();
+            platform::sleepMs(8);
+            continue;
+        }
+        g_dirty = false;
+        lastDraw = now0;
 
         if (top->drawsVideo()) {
             gfx::flush();
@@ -198,16 +222,58 @@ void run()
 namespace ui {
 
 static SDL_Texture* g_bgLocal = nullptr;
-static SDL_Texture* g_logoLocal = nullptr;
 
-SDL_Texture* logo()
+SDL_Texture* logo(int size)
 {
     if (!app::branding().logoUrl.empty()) {
-        SDL_Texture* t = images::get(app::branding().logoUrl, 400, 400);
+        SDL_Texture* t = images::get(app::branding().logoUrl, size, size, true);
         if (t) return t;
     }
-    if (!g_logoLocal) g_logoLocal = gfx::loadTextureFile(APP_ASSETS "/images/uni_logo.png");
-    return g_logoLocal;
+    return images::get(APP_ASSETS "/images/uni_logo.png", size, size, true);
+}
+
+// Composição em cache: imagem de fundo escalada + escurecimento, numa textura opaca do tamanho da tela.
+// Desenhá-la é uma cópia direta (sem escala/mistura), o que é rápido no renderizador por software.
+struct Composite {
+    SDL_Texture* src;
+    uint8_t dim;
+    SDL_Texture* tex;
+    uint64_t used;
+};
+static std::vector<Composite> g_comps;
+
+static SDL_Texture* composite(SDL_Texture* src, uint8_t dim)
+{
+    for (auto& c : g_comps)
+        if (c.src == src && c.dim == dim) { c.used = platform::ticksMs(); return c.tex; }
+    SDL_Renderer* r = gfx::renderer();
+    SDL_Texture* tex = SDL_CreateTexture(r, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, SCREEN_W, SCREEN_H);
+    if (!tex) return nullptr;
+    SDL_SetRenderTarget(r, tex);
+    gfx::fillRect(0, 0, SCREEN_W, SCREEN_H, col::bg);
+    gfx::drawTextureCover(src, 0, 0, SCREEN_W, SCREEN_H);
+    if (dim) gfx::fillRect(0, 0, SCREEN_W, SCREEN_H, {6, 8, 18, dim});
+    SDL_SetRenderTarget(r, NULL);
+    SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_NONE);
+    if (g_comps.size() >= 3) { // mantém no máximo 3 (8 MB cada)
+        size_t old = 0;
+        for (size_t i = 1; i < g_comps.size(); i++) if (g_comps[i].used < g_comps[old].used) old = i;
+        SDL_DestroyTexture(g_comps[old].tex);
+        g_comps.erase(g_comps.begin() + (long)old);
+    }
+    g_comps.push_back({src, dim, tex, platform::ticksMs()});
+    return tex;
+}
+
+static void drawFullscreen(SDL_Texture* src, uint8_t dim)
+{
+    SDL_Texture* c = composite(src, dim);
+    if (c) {
+        SDL_RenderCopy(gfx::renderer(), c, NULL, NULL);
+    } else { // sem suporte a render target: caminho lento
+        gfx::drawTextureCover(src, 0, 0, SCREEN_W, SCREEN_H);
+        if (dim) gfx::fillRect(0, 0, SCREEN_W, SCREEN_H, {6, 8, 18, dim});
+    }
 }
 
 void background(uint8_t dim)
@@ -218,14 +284,20 @@ void background(uint8_t dim)
         if (!g_bgLocal) g_bgLocal = gfx::loadTextureFile(APP_ASSETS "/images/bg_main.jpg");
         bg = g_bgLocal;
     }
-    if (bg) gfx::drawTextureCover(bg, 0, 0, SCREEN_W, SCREEN_H);
-    if (dim) gfx::fillRect(0, 0, SCREEN_W, SCREEN_H, {6, 8, 18, dim});
+    if (bg) drawFullscreen(bg, dim);
+}
+
+void backdrop(const std::string& url, uint8_t dim)
+{
+    SDL_Texture* t = images::get(url, SCREEN_W / 2, SCREEN_H / 2);
+    if (t) drawFullscreen(t, dim);
+    else background(dim);
 }
 
 void header(const std::string& title, const std::string& subtitle)
 {
     gfx::fillGradientV(0, 0, SCREEN_W, 120, {0, 0, 0, 200}, {0, 0, 0, 0});
-    SDL_Texture* lg = logo();
+    SDL_Texture* lg = logo(90);
     if (lg) gfx::drawTextureFit(lg, 50, 18, 90, 90);
     gfx::text(title, 165, 26, 40, col::text, true, 1200);
     if (!subtitle.empty()) gfx::text(subtitle, 167, 76, 24, col::dim, false, 1200);
@@ -252,6 +324,7 @@ void footer(const std::vector<std::pair<std::string, std::string>>& hints)
 
 void spinner(int cx, int cy, int r)
 {
+    app::redraw(); // animação: pede o próximo quadro
     uint64_t t = platform::ticksMs();
     for (int i = 0; i < 10; i++) {
         double a = (double)i / 10.0 * 6.2831853 + (double)(t % 1200) / 1200.0 * 6.2831853;
@@ -270,7 +343,7 @@ void focusFrame(int x, int y, int w, int h)
 
 void button(int x, int y, int w, int h, const std::string& label, bool focused, bool primary)
 {
-    Color bg = focused ? col::accent : (primary ? Color{40, 50, 90, 240} : Color{36, 42, 70, 230});
+    Color bg = focused ? col::accent : (primary ? Color{40, 50, 90, 255} : Color{36, 42, 70, 255});
     gfx::fillRect(x, y, w, h, bg);
     if (focused) gfx::drawRect(x - 3, y - 3, w + 6, h + 6, 3, col::white);
     gfx::text(label, x + w / 2, y + (h - 30) / 2, 28, col::white, true, w - 20, Align::Center);
@@ -278,10 +351,10 @@ void button(int x, int y, int w, int h, const std::string& label, bool focused, 
 
 void poster(const std::string& url, int x, int y, int w, int h, const std::string& fallbackText, bool cover)
 {
-    SDL_Texture* t = images::get(url, w, h);
+    SDL_Texture* t = images::get(url, w, h, !cover);
     if (t) {
-        gfx::fillRect(x, y, w, h, {15, 18, 30, 255});
-        if (cover) gfx::drawTextureCover(t, x, y, w, h);
+        if (!cover) gfx::fillRect(x, y, w, h, {15, 18, 30, 255});
+        if (cover) gfx::drawTexture(t, x, y, w, h);
         else gfx::drawTextureFit(t, x, y, w, h);
         return;
     }
