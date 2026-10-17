@@ -27,7 +27,7 @@ CPPFILES    := $(wildcard $(SRCDIR)/*.cpp)
 OBJS        := $(patsubst $(SRCDIR)/%.cpp, $(INTDIR)/%.o, $(CPPFILES))
 
 # libc++ precisa vir antes dos headers C (musl) para o <cmath> funcionar
-CXXFLAGS    := --target=x86_64-pc-freebsd12-elf -fPIC -funwind-tables -c $(EXTRAFLAGS) -std=gnu++17 -isysroot $(TOOLCHAIN) \n               -isystem $(TOOLCHAIN)/include/c++/v1 -isystem $(TOOLCHAIN)/include
+CXXFLAGS    := --target=x86_64-pc-freebsd12-elf -fPIC -funwind-tables -c $(EXTRAFLAGS) -std=gnu++17 -isysroot $(TOOLCHAIN) -isystem $(TOOLCHAIN)/include/c++/v1 -isystem $(TOOLCHAIN)/include
 LDFLAGS     := -m elf_x86_64 -pie --script $(TOOLCHAIN)/link.x --eh-frame-hdr -L$(TOOLCHAIN)/lib $(LIBS) $(TOOLCHAIN)/lib/crt1.o
 
 _unused     := $(shell mkdir -p $(INTDIR))
