@@ -35,6 +35,8 @@ extern "C" {
 // as threads dele passam por aqui e ganham pilha de 1 MB (a padrão do musl é pequena).
 extern "C" int unitv_pthread_create(pthread_t* t, const pthread_attr_t* a, void* (*fn)(void*), void* arg)
 {
+    static std::atomic<int> count{0};
+    if (count++ == 0) platform::log("threads do FFmpeg usando pilha de 1 MB");
     if (a) return pthread_create(t, a, fn, arg);
     pthread_attr_t attr;
     pthread_attr_init(&attr);
@@ -101,6 +103,7 @@ static Thread g_openThread, g_readThread, g_videoThread, g_audioThread;
 // busca
 static std::mutex g_seekMtx;
 static bool g_seekReq = false;
+static std::atomic<bool> g_seekFlag{false}; // busca pendente (acorda a leitura bloqueada)
 static int64_t g_seekTargetMs = 0;
 static std::atomic<int64_t> g_seekShowMs{-1}; // posição exibida enquanto busca
 
@@ -283,12 +286,16 @@ struct PacketQueue {
     std::mutex m;
     std::condition_variable cv;
     size_t maxBytes = 8u << 20;
+    size_t maxCount = 300; // ~10 s de vídeo: limita a memória mesmo com pacotes pequenos
 
     void push(AVPacket* p, int serial)
     {
         std::unique_lock<std::mutex> lk(m);
-        cv.wait(lk, [&] { return g_stop || bytes < maxBytes || q.size() < 8; });
-        if (g_stop) { if (p) av_packet_free(&p); return; }
+        cv.wait(lk, [&] {
+            return g_stop || g_seekFlag || q.size() < 8 || (bytes < maxBytes && q.size() < maxCount);
+        });
+        // parado ou busca pendente: descarta (a busca vai esvaziar as filas de qualquer forma)
+        if (g_stop || (g_seekFlag && p)) { if (p) av_packet_free(&p); return; }
         q.push_back({p, serial});
         if (p) bytes += (size_t)p->size;
         cv.notify_all();
@@ -331,7 +338,7 @@ struct VFrame {
 };
 
 static PacketQueue g_vq, g_aq;
-static struct QueueInit { QueueInit() { g_aq.maxBytes = 2u << 20; } } g_queueInit;
+static struct QueueInit { QueueInit() { g_aq.maxBytes = 2u << 20; g_aq.maxCount = 600; } } g_queueInit;
 static std::deque<VFrame> g_fq;
 static std::mutex g_fqMtx;
 static std::condition_variable g_fqCv;
@@ -388,7 +395,7 @@ static void readLoop()
         int64_t target = 0;
         {
             std::lock_guard<std::mutex> lk(g_seekMtx);
-            if (g_seekReq) { doSeek = true; target = g_seekTargetMs; g_seekReq = false; }
+            if (g_seekReq) { doSeek = true; target = g_seekTargetMs; g_seekReq = false; g_seekFlag = false; }
         }
         if (doSeek) {
             platform::log("seek para %lld ms (mem livre %d MB)", (long long)target, platform::freeMemoryMB());
@@ -782,10 +789,16 @@ void togglePause()
 void seekTo(uint64_t ms)
 {
     if (!g_opened || g_durationMs == 0) return;
-    std::lock_guard<std::mutex> lk(g_seekMtx);
-    g_seekReq = true;
-    g_seekTargetMs = (int64_t)ms;
-    g_seekShowMs = (int64_t)ms;
+    {
+        std::lock_guard<std::mutex> lk(g_seekMtx);
+        g_seekReq = true;
+        g_seekTargetMs = (int64_t)ms;
+        g_seekShowMs = (int64_t)ms;
+        g_seekFlag = true;
+    }
+    platform::log("busca pedida: %llu ms", (unsigned long long)ms);
+    g_vq.wake(); // a leitura pode estar esperando espaço na fila
+    g_aq.wake();
 }
 
 // ---------------------------------------------------------------------------

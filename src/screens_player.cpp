@@ -183,6 +183,12 @@ public:
     {
         uint64_t now = platform::ticksMs();
         player::State st = player::state();
+        static uint64_t lastBeat = 0;
+        if (now - lastBeat > 5000) {
+            lastBeat = now;
+            platform::log("tela player: estado=%d pos=%llu ms mem=%d MB", (int)st,
+                          (unsigned long long)player::positionMs(), platform::freeMemoryMB());
+        }
 
         if (seekCommitAt_ && now >= seekCommitAt_) {
             player::seekTo(seekAccum_);

@@ -8,6 +8,7 @@
 #include "ui.h"
 #include "screens.h"
 #include "player.h"
+#include "crash.h"
 
 #include <orbis/SystemService.h>
 
@@ -17,6 +18,7 @@ int main(int argc, char* argv[])
     (void)argv;
     platform::init();
     platform::log("Iniciando UnitV Pro");
+    crash::install();
 
     if (!gfx::init()) {
         platform::log("Falha ao iniciar gráficos");
