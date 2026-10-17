@@ -147,8 +147,46 @@ typedef struct {
     SceAvPlayerStreamDetailsEx details;
 } SceAvPlayerFrameInfoEx;
 
+typedef enum {
+    SCE_AVPLAYER_SOURCE_TYPE_UNKNOWN = 0,
+    SCE_AVPLAYER_SOURCE_TYPE_FILE_MP4 = 1,
+    SCE_AVPLAYER_SOURCE_TYPE_HLS = 8,
+} SceAvPlayerSourceType;
+
+typedef struct {
+    const char* name;
+    uint32_t length;
+} SceAvPlayerUri;
+
+typedef struct {
+    SceAvPlayerUri uri;
+    uint8_t reserved1[64];
+    int32_t sourceType;
+    uint8_t reserved2[44];
+} SceAvPlayerSourceDetails;
+
+typedef struct {
+    uint8_t decoderType[4];
+    uint8_t decoderParams[28];
+} SceAvPlayerDecoderInit;
+
+typedef struct {
+    uint32_t httpContextId;
+    uint32_t sslContextId;
+} SceAvPlayerHTTPCtx;
+
+typedef struct {
+    uint32_t demuxVideoBufferSize;
+    SceAvPlayerDecoderInit videoDecoderInit;
+    SceAvPlayerDecoderInit audioDecoderInit;
+    SceAvPlayerHTTPCtx httpCtx;
+    uint8_t reserved[56];
+} SceAvPlayerPostInitData;
+
 SceAvPlayerHandle sceAvPlayerInit(SceAvPlayerInitData* pInit);
+int32_t sceAvPlayerPostInit(SceAvPlayerHandle h, SceAvPlayerPostInitData* pPostInit);
 int32_t sceAvPlayerAddSource(SceAvPlayerHandle h, const char* filename);
+int32_t sceAvPlayerAddSourceEx(SceAvPlayerHandle h, uint32_t uriType, SceAvPlayerSourceDetails* sourceDetails);
 int32_t sceAvPlayerClose(SceAvPlayerHandle h);
 uint64_t sceAvPlayerCurrentTime(SceAvPlayerHandle h);
 bool sceAvPlayerGetAudioData(SceAvPlayerHandle h, SceAvPlayerFrameInfo* frameInfo);

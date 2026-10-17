@@ -1,6 +1,7 @@
 #include "player.h"
 #include "avplayer_abi.h"
 #include "platform.h"
+#include "http.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -9,13 +10,17 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <memory>
 
 #include <orbis/libkernel.h>
 #include <orbis/AudioOut.h>
 
 namespace player {
 
-static SceAvPlayerHandle g_h = nullptr;
+static std::atomic<SceAvPlayerHandle> g_h{nullptr};
+static std::thread g_openThread;
+static std::atomic<bool> g_opening{false};
+static std::unique_ptr<http::RangeFile> g_file; // filmes/episódios: o app baixa e entrega os bytes ao AvPlayer
 static std::atomic<int> g_state{(int)State::Idle};
 static std::atomic<bool> g_audioRun{false};
 static std::thread g_audioThread;
@@ -204,6 +209,117 @@ static void audioLoop()
 
 // --------------------------------------------------------------------------
 
+// Callbacks de "arquivo" do AvPlayer apontando para o RangeFile (HTTP Range)
+static int32_t fileOpenCb(void*, const char*) { return 0; }
+static int32_t fileCloseCb(void*) { return 0; }
+static int32_t fileReadCb(void*, uint8_t* buf, uint64_t pos, uint32_t len)
+{
+    return g_file ? g_file->read(buf, pos, len) : -1;
+}
+static uint64_t fileSizeCb(void*) { return g_file ? g_file->size() : 0; }
+
+static void setError(const std::string& msg)
+{
+    std::lock_guard<std::mutex> lk(g_mtx);
+    g_error = msg;
+    g_state = (int)State::Error;
+}
+
+static bool hasExt(const std::string& url, const char* ext)
+{
+    std::string u = url;
+    size_t q = u.find('?');
+    if (q != std::string::npos) u = u.substr(0, q);
+    size_t n = strlen(ext);
+    return u.size() >= n && u.compare(u.size() - n, n, ext) == 0;
+}
+
+static void openWorker(std::string url)
+{
+    bool hls = hasExt(url, ".m3u8");
+    bool useFile = !hls && !hasExt(url, ".ts");
+
+    if (useFile) {
+        g_file.reset(new http::RangeFile());
+        if (!g_file->open(url)) {
+            g_file.reset();
+            setError("Não foi possível conectar ao vídeo (servidor não respondeu ou link inválido).");
+            g_opening = false;
+            return;
+        }
+    }
+
+    SceAvPlayerInitData init;
+    memset(&init, 0, sizeof(init));
+    init.memoryReplacement.allocate = allocCb;
+    init.memoryReplacement.deallocate = freeCb;
+    init.memoryReplacement.allocateTexture = allocTextureCb;
+    init.memoryReplacement.deallocateTexture = freeTextureCb;
+    init.eventReplacement.eventCallback = eventCb;
+    if (useFile) {
+        init.fileReplacement.open = fileOpenCb;
+        init.fileReplacement.close = fileCloseCb;
+        init.fileReplacement.readOffset = fileReadCb;
+        init.fileReplacement.size = fileSizeCb;
+    }
+    init.debugLevel = 0;
+    init.basePriority = 700;
+    init.numOutputVideoFramebuffers = 2;
+    init.autoStart = true;
+    init.defaultLanguage = "por";
+
+    SceAvPlayerHandle h = sceAvPlayerInit(&init);
+    if (!h) {
+        setError("Falha ao iniciar o player do sistema (libSceAvPlayer).");
+        g_file.reset();
+        g_opening = false;
+        return;
+    }
+
+    int ret;
+    if (useFile) {
+        // nome "virtual": o AvPlayer lê pelos callbacks; a extensão indica o formato
+        std::string name = "/app0/stream.mp4";
+        platform::log("Abrindo (via HTTP Range): %s", url.c_str());
+        ret = sceAvPlayerAddSource(h, name.c_str());
+    } else {
+        int httpCtx = 0, sslCtx = 0;
+        http::contexts(httpCtx, sslCtx);
+        SceAvPlayerPostInitData post;
+        memset(&post, 0, sizeof(post));
+        post.httpCtx.httpContextId = (uint32_t)httpCtx;
+        post.httpCtx.sslContextId = (uint32_t)sslCtx;
+        int pr = sceAvPlayerPostInit(h, &post);
+        platform::log("sceAvPlayerPostInit 0x%08X", pr);
+
+        SceAvPlayerSourceDetails sd;
+        memset(&sd, 0, sizeof(sd));
+        sd.uri.name = url.c_str();
+        sd.uri.length = (uint32_t)url.size();
+        sd.sourceType = hls ? SCE_AVPLAYER_SOURCE_TYPE_HLS : SCE_AVPLAYER_SOURCE_TYPE_UNKNOWN;
+        platform::log("Abrindo (stream): %s", url.c_str());
+        ret = sceAvPlayerAddSourceEx(h, 0, &sd);
+        if (ret < 0) {
+            platform::log("AddSourceEx 0x%08X, tentando AddSource", ret);
+            ret = sceAvPlayerAddSource(h, url.c_str());
+        }
+    }
+
+    if (ret < 0) {
+        char buf[200];
+        snprintf(buf, sizeof(buf), "O player do PS4 não conseguiu abrir este vídeo (0x%08X).", ret);
+        setError(buf);
+        sceAvPlayerClose(h);
+        g_file.reset();
+        g_opening = false;
+        return;
+    }
+    g_h = h;
+    g_audioRun = true;
+    g_audioThread = std::thread(audioLoop);
+    g_opening = false;
+}
+
 bool open(const std::string& url)
 {
     close();
@@ -216,45 +332,17 @@ bool open(const std::string& url)
     g_hasFrame = false;
     g_duration = 0;
 
-    SceAvPlayerInitData init;
-    memset(&init, 0, sizeof(init));
-    init.memoryReplacement.allocate = allocCb;
-    init.memoryReplacement.deallocate = freeCb;
-    init.memoryReplacement.allocateTexture = allocTextureCb;
-    init.memoryReplacement.deallocateTexture = freeTextureCb;
-    init.eventReplacement.eventCallback = eventCb;
-    init.debugLevel = 0;
-    init.basePriority = 700;
-    init.numOutputVideoFramebuffers = 2;
-    init.autoStart = true;
-    init.defaultLanguage = "por";
-
-    g_h = sceAvPlayerInit(&init);
-    if (!g_h) {
-        g_error = "Falha ao iniciar o player do sistema (libSceAvPlayer).";
-        g_state = (int)State::Error;
-        return false;
-    }
-    platform::log("Abrindo: %s", url.c_str());
-    int ret = sceAvPlayerAddSource(g_h, url.c_str());
-    if (ret < 0) {
-        char buf[128];
-        snprintf(buf, sizeof(buf), "Não foi possível abrir o link (0x%08X).", ret);
-        g_error = buf;
-        g_state = (int)State::Error;
-        sceAvPlayerClose(g_h);
-        g_h = nullptr;
-        return false;
-    }
     g_state = (int)State::Opening;
     g_openedAt = platform::ticksMs();
-    g_audioRun = true;
-    g_audioThread = std::thread(audioLoop);
+    g_opening = true;
+    // A abertura faz rede (pode demorar): roda fora da thread da interface
+    g_openThread = std::thread(openWorker, url);
     return true;
 }
 
 void close()
 {
+    if (g_openThread.joinable()) g_openThread.join();
     if (g_audioRun) {
         g_audioRun = false;
         if (g_audioThread.joinable()) g_audioThread.join();
@@ -264,11 +352,12 @@ void close()
         sceAvPlayerClose(g_h);
         g_h = nullptr;
     }
+    g_file.reset();
     g_hasFrame = false;
     g_state = (int)State::Idle;
 }
 
-bool isOpen() { return g_h != nullptr; }
+bool isOpen() { return g_h != nullptr || g_opening; }
 
 State state() { return (State)g_state.load(); }
 
@@ -412,14 +501,15 @@ void render(SDL_Surface* dst)
             }
             g_everPlayed = true;
         }
-        // tempo limite para abrir
-        if (g_state == (int)State::Opening && platform::ticksMs() - g_openedAt > 30000) {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            g_error = "Tempo esgotado ao conectar ao vídeo.";
-            g_state = (int)State::Error;
-        }
         if (g_everPlayed && g_state == (int)State::Playing && !sceAvPlayerIsActive(g_h))
             g_state = (int)State::Ended;
+    }
+
+    // tempo limite para abrir
+    if (g_state == (int)State::Opening && !g_opening && platform::ticksMs() - g_openedAt > 40000) {
+        std::lock_guard<std::mutex> lk(g_mtx);
+        g_error = "Tempo esgotado ao conectar ao vídeo.";
+        g_state = (int)State::Error;
     }
 
     if (g_hasFrame && g_frameW == dst->w && g_frameH == dst->h) {

@@ -50,6 +50,15 @@ static bool isDir(Btn b) { return b == Btn::Up || b == Btn::Down || b == Btn::Le
 static void press(std::vector<Btn>& out, Btn b)
 {
     if (b == Btn::None) return;
+    // O port SDL do PS4 envia o direcional como botão E como hat ao mesmo tempo:
+    // ignora a mesma direção repetida em menos de 150 ms (senão anda dois itens)
+    static uint64_t lastAt[16] = {0};
+    uint64_t now = platform::ticksMs();
+    int k = (int)b;
+    if (isDir(b) && k < 16) {
+        if (now - lastAt[k] < 150) return;
+        lastAt[k] = now;
+    }
     out.push_back(b);
     if (isDir(b)) {
         g_held = b;

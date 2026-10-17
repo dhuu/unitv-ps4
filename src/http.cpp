@@ -31,11 +31,17 @@ bool init()
     sceNetInit();
     g_netPool = sceNetPoolCreate("unitv_net", 64 * 1024, 0);
     if (g_netPool < 0) { platform::log("sceNetPoolCreate 0x%08X", g_netPool); return false; }
-    g_ssl = sceSslInit(512 * 1024);
+    g_ssl = sceSslInit(1024 * 1024);
     if (g_ssl < 0) { platform::log("sceSslInit 0x%08X", g_ssl); return false; }
-    g_http = sceHttpInit(g_netPool, g_ssl, 512 * 1024);
+    g_http = sceHttpInit(g_netPool, g_ssl, 2 * 1024 * 1024);
     if (g_http < 0) { platform::log("sceHttpInit 0x%08X", g_http); return false; }
     return true;
+}
+
+void contexts(int& httpCtx, int& sslCtx)
+{
+    httpCtx = g_http;
+    sslCtx = g_ssl;
 }
 
 Response get(const std::string& url, size_t maxBytes, int timeoutSec)

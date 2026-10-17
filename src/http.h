@@ -15,3 +15,49 @@ bool init();
 Response get(const std::string& url, size_t maxBytes = 0, int timeoutSec = 25);
 
 } // namespace http
+
+#include <cstdint>
+#include <vector>
+#include <mutex>
+
+namespace http {
+
+void contexts(int& httpCtx, int& sslCtx);
+
+// Download sequencial a partir de um deslocamento (Range: bytes=from-)
+struct Stream {
+    int tpl = -1, conn = -1, req = -1;
+    uint64_t pos = 0;     // próximo byte que será lido
+    uint64_t total = 0;   // tamanho total do arquivo (0 = desconhecido)
+    bool open = false;
+};
+bool streamOpen(Stream& st, const std::string& url, uint64_t from);
+int streamRead(Stream& st, void* buf, uint32_t len); // bytes lidos, 0 = fim, <0 = erro
+void streamClose(Stream& st);
+
+// Arquivo remoto com acesso aleatório (para o AvPlayer ler MP4 como se fosse local).
+// Usa blocos em cache e reaproveita a conexão quando a leitura é sequencial.
+class RangeFile {
+public:
+    bool open(const std::string& url);
+    int read(uint8_t* buf, uint64_t pos, uint32_t len);
+    uint64_t size() const { return size_; }
+    void close();
+    ~RangeFile() { close(); }
+
+private:
+    struct Block {
+        uint64_t idx = 0;
+        std::vector<uint8_t> data;
+        uint64_t used = 0;
+    };
+    bool fetch(uint64_t idx, Block& out);
+    std::string url_;
+    uint64_t size_ = 0;
+    uint64_t tick_ = 0;
+    Stream st_;
+    std::vector<Block> cache_;
+    std::mutex mtx_;
+};
+
+} // namespace http
