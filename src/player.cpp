@@ -31,6 +31,19 @@ extern "C" {
 #include <orbis/AudioOut.h>
 #include <orbis/UserService.h>
 
+// O FFmpeg é compilado com -Dpthread_create=unitv_pthread_create (scripts/build-ffmpeg.sh):
+// as threads dele passam por aqui e ganham pilha de 1 MB (a padrão do musl é pequena).
+extern "C" int unitv_pthread_create(pthread_t* t, const pthread_attr_t* a, void* (*fn)(void*), void* arg)
+{
+    if (a) return pthread_create(t, a, fn, arg);
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 1024 * 1024);
+    int r = pthread_create(t, &attr, fn, arg);
+    pthread_attr_destroy(&attr);
+    return r;
+}
+
 namespace player {
 
 // ---------------------------------------------------------------------------
