@@ -313,10 +313,12 @@ struct PacketQueue {
         if (p) bytes += (size_t)p->size;
         cv.notify_all();
     }
-    bool pop(PktEntry& out, int timeoutMs)
+    // Espera sem tempo limite: no PS4 o wait_for da libc++ lança exceção quando o tempo esgota
+    // (a libkernel devolve um código de ETIMEDOUT diferente do esperado). close() acorda com wake().
+    bool pop(PktEntry& out, int /*timeoutMs*/)
     {
         std::unique_lock<std::mutex> lk(m);
-        if (!cv.wait_for(lk, std::chrono::milliseconds(timeoutMs), [&] { return g_stop || !q.empty(); })) return false;
+        cv.wait(lk, [&] { return g_stop || !q.empty(); });
         if (g_stop || q.empty()) return false;
         out = q.front();
         q.pop_front();
