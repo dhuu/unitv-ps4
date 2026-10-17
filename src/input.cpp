@@ -16,16 +16,17 @@ static const int kMaxButtons = 32;
 
 static SDL_Joystick* g_joy = nullptr;
 static bool g_prevBtn[kMaxButtons] = {false};
-static Btn g_dir = Btn::None;      // direção mantida no quadro anterior
-static uint64_t g_nextRepeat = 0;
 
-void init()
-{
-    if (SDL_NumJoysticks() > 0) g_joy = SDL_JoystickOpen(0);
-    if (!g_joy) platform::log("Nenhum controle encontrado");
-    else platform::log("Controle: %d botões, %d hats, %d eixos", SDL_JoystickNumButtons(g_joy),
-                       SDL_JoystickNumHats(g_joy), SDL_JoystickNumAxes(g_joy));
-}
+// Direções só pelo direcional (o analógico é ignorado). O SDL informa o direcional
+// de dois jeitos, botões e hat; cada um tem a própria detecção de "apertou agora",
+// então um deles preso numa direção não bloqueia os toques seguintes.
+enum { SRC_BTN = 0, SRC_HAT = 1, SRC_COUNT = 2 };
+static Btn g_src[SRC_COUNT] = {Btn::None, Btn::None};
+static Btn g_held = Btn::None;     // direção que está repetindo
+static int g_heldSrc = -1;         // fonte que iniciou a repetição
+static uint64_t g_nextRepeat = 0;
+static Btn g_lastEdge = Btn::None; // último toque emitido (descarta duplicado de outra fonte)
+static uint64_t g_lastEdgeAt = 0;
 
 static Btn mapButton(int b)
 {
@@ -44,38 +45,37 @@ static Btn mapButton(int b)
     }
 }
 
-// Direção atual combinando direcional (botões ou hat) e analógico esquerdo
-static Btn currentDirection()
+static const char* dirName(Btn d)
 {
-    if (!g_joy) return Btn::None;
-    int nb = SDL_JoystickNumButtons(g_joy);
-    if (nb > PAD_RIGHT) {
-        if (SDL_JoystickGetButton(g_joy, PAD_UP)) return Btn::Up;
-        if (SDL_JoystickGetButton(g_joy, PAD_DOWN)) return Btn::Down;
-        if (SDL_JoystickGetButton(g_joy, PAD_LEFT)) return Btn::Left;
-        if (SDL_JoystickGetButton(g_joy, PAD_RIGHT)) return Btn::Right;
+    switch (d) {
+    case Btn::Up: return "cima";
+    case Btn::Down: return "baixo";
+    case Btn::Left: return "esq";
+    case Btn::Right: return "dir";
+    default: return "-";
+    }
+}
+
+// Lê a direção de cada fonte neste quadro
+static void readDirections(Btn out[SRC_COUNT], int& hatRaw)
+{
+    for (int i = 0; i < SRC_COUNT; i++) out[i] = Btn::None;
+    hatRaw = 0;
+    if (!g_joy) return;
+    if (SDL_JoystickNumButtons(g_joy) > PAD_RIGHT) {
+        if (SDL_JoystickGetButton(g_joy, PAD_UP)) out[SRC_BTN] = Btn::Up;
+        else if (SDL_JoystickGetButton(g_joy, PAD_DOWN)) out[SRC_BTN] = Btn::Down;
+        else if (SDL_JoystickGetButton(g_joy, PAD_LEFT)) out[SRC_BTN] = Btn::Left;
+        else if (SDL_JoystickGetButton(g_joy, PAD_RIGHT)) out[SRC_BTN] = Btn::Right;
     }
     if (SDL_JoystickNumHats(g_joy) > 0) {
         Uint8 h = SDL_JoystickGetHat(g_joy, 0);
-        if (h & SDL_HAT_UP) return Btn::Up;
-        if (h & SDL_HAT_DOWN) return Btn::Down;
-        if (h & SDL_HAT_LEFT) return Btn::Left;
-        if (h & SDL_HAT_RIGHT) return Btn::Right;
+        hatRaw = h;
+        if (h & SDL_HAT_UP) out[SRC_HAT] = Btn::Up;
+        else if (h & SDL_HAT_DOWN) out[SRC_HAT] = Btn::Down;
+        else if (h & SDL_HAT_LEFT) out[SRC_HAT] = Btn::Left;
+        else if (h & SDL_HAT_RIGHT) out[SRC_HAT] = Btn::Right;
     }
-    if (SDL_JoystickNumAxes(g_joy) >= 2) {
-        // histerese: precisa passar de 24000 para ativar; mantém enquanto acima de 14000
-        int x = SDL_JoystickGetAxis(g_joy, 0), y = SDL_JoystickGetAxis(g_joy, 1);
-        int on = 24000, keep = 14000;
-        auto active = [&](Btn d, int v, bool neg) {
-            int lim = g_dir == d ? keep : on;
-            return neg ? v < -lim : v > lim;
-        };
-        if (active(Btn::Up, y, true)) return Btn::Up;
-        if (active(Btn::Down, y, false)) return Btn::Down;
-        if (active(Btn::Left, x, true)) return Btn::Left;
-        if (active(Btn::Right, x, false)) return Btn::Right;
-    }
-    return Btn::None;
 }
 
 std::vector<Btn> poll()
@@ -103,18 +103,43 @@ std::vector<Btn> poll()
         g_prevBtn[i] = down;
     }
 
-    // direções: lidas pelo estado atual (evita eventos duplicados ou "soltar" perdido)
+    // direções: estado atual de cada fonte, com borda de subida por fonte
     uint64_t now = platform::ticksMs();
-    Btn d = currentDirection();
-    if (d != g_dir) {
-        g_dir = d;
-        if (d != Btn::None) {
-            out.push_back(d);
-            g_nextRepeat = now + 380;
+    Btn cur[SRC_COUNT];
+    int hatRaw;
+    readDirections(cur, hatRaw);
+
+    bool changed = false;
+    for (int s = 0; s < SRC_COUNT; s++) {
+        if (cur[s] == g_src[s]) continue;
+        changed = true;
+        Btn d = cur[s];
+        g_src[s] = d;
+        if (d == Btn::None) continue;
+        // o mesmo toque costuma chegar como botão e como hat: só conta uma vez
+        if (d == g_lastEdge && now - g_lastEdgeAt < 120) {
+            if (g_held == d && cur[g_heldSrc] != d) g_heldSrc = s;
+            continue;
         }
-    } else if (d != Btn::None && now >= g_nextRepeat) {
-        out.push_back(d);       // auto-repetição enquanto segura
-        g_nextRepeat = now + 85;
+        out.push_back(d);
+        g_lastEdge = d;
+        g_lastEdgeAt = now;
+        g_held = d;
+        g_heldSrc = s;
+        g_nextRepeat = now + 380;
+    }
+    if (changed)
+        platform::log("direcional: botoes=%s hat=%s(%d)", dirName(cur[SRC_BTN]), dirName(cur[SRC_HAT]), hatRaw);
+
+    // auto-repetição enquanto a fonte que iniciou continua segurando
+    if (g_held != Btn::None) {
+        if (g_heldSrc < 0 || cur[g_heldSrc] != g_held) {
+            g_held = Btn::None;
+            g_heldSrc = -1;
+        } else if (now >= g_nextRepeat) {
+            out.push_back(g_held);
+            g_nextRepeat = now + 85;
+        }
     }
     return out;
 }
