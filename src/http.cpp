@@ -44,8 +44,9 @@ void contexts(int& httpCtx, int& sslCtx)
     sslCtx = g_ssl;
 }
 
-Response get(const std::string& url, size_t maxBytes, int timeoutSec)
+Response get(const std::string& urlIn, size_t maxBytes, int timeoutSec)
 {
+    std::string url = urlIn.substr(0, urlIn.find('#')); // fragmento não vai na requisição
     Response res;
     int tpl = -1, conn = -1, req = -1, ret;
     int32_t status = 0;

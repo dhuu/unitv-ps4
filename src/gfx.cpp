@@ -377,7 +377,7 @@ static std::deque<Job> g_queue;
 static std::vector<Decoded> g_done;
 static std::mutex g_mtx;
 static std::condition_variable g_cv;
-static const size_t kMaxTextures = 240;
+static const size_t kMaxTextures = 140;
 
 // Reamostra a região (cx,cy,cw,ch) da origem para exatamente dw x dh (média por caixa).
 // Gerar a textura no tamanho final evita escala a cada quadro no renderizador por software.

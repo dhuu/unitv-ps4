@@ -44,8 +44,10 @@ static uint64_t parseTotal(const char* hdr, size_t len, uint64_t from, int statu
 }
 
 // Abre uma requisição; useRange=false manda GET simples (alguns painéis respondem 400 ao Range)
-static int openRequest(Stream& st, const std::string& url, uint64_t from, bool useRange)
+static int openRequest(Stream& st, const std::string& urlIn, uint64_t from, bool useRange)
 {
+    // o fragmento (#...) não faz parte da requisição HTTP
+    std::string url = urlIn.substr(0, urlIn.find('#'));
     streamClose(st);
     int httpCtx, sslCtx;
     contexts(httpCtx, sslCtx);

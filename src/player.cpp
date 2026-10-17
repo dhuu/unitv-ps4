@@ -25,6 +25,7 @@ extern "C" {
 #include <libswscale/swscale.h>
 #include <libswresample/swresample.h>
 #include <libavutil/channel_layout.h>
+#include <libavutil/pixdesc.h>
 }
 
 #include <orbis/AudioOut.h>
@@ -267,7 +268,7 @@ struct PacketQueue {
     size_t bytes = 0;
     std::mutex m;
     std::condition_variable cv;
-    size_t maxBytes = 16u << 20;
+    size_t maxBytes = 8u << 20;
 
     void push(AVPacket* p, int serial)
     {
@@ -316,6 +317,7 @@ struct VFrame {
 };
 
 static PacketQueue g_vq, g_aq;
+static struct QueueInit { QueueInit() { g_aq.maxBytes = 2u << 20; } } g_queueInit;
 static std::deque<VFrame> g_fq;
 static std::mutex g_fqMtx;
 static std::condition_variable g_fqCv;
@@ -553,7 +555,8 @@ static AVCodecContext* openDecoder(int idx, bool video)
     avcodec_parameters_to_context(c, st->codecpar);
     c->pkt_timebase = st->time_base;
     if (video) {
-        c->thread_count = 6;
+        // 4K usa menos threads (cada uma guarda quadros enormes na memória)
+        c->thread_count = st->codecpar->width > 1920 ? 4 : 6;
         c->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
         c->flags2 |= AV_CODEC_FLAG2_FAST;
         // 1080p ou mais em CPU: pula o deblocking dos quadros não-referência (mais leve)
@@ -763,8 +766,11 @@ void seekTo(uint64_t ms)
 static void convertFrame(AVFrame* f, SDL_Surface* dst)
 {
     int outW = dst->w, outH = dst->h;
-    if ((int)g_frame.size() != outW * outH) {
-        g_frame.assign((size_t)outW * outH, 0xFF000000u);
+    if (f->width <= 0 || f->height <= 0 || f->format < 0 || !f->data[0]) return;
+    // folga de 2 linhas: o swscale (SIMD) pode escrever alguns pixels além da largura pedida
+    const size_t needed = (size_t)outW * (outH + 2);
+    if (g_frame.size() != needed) {
+        g_frame.assign(needed, 0xFF000000u);
         g_lastSrcW = 0;
     }
     g_frameW = outW;
@@ -777,11 +783,14 @@ static void convertFrame(AVFrame* f, SDL_Surface* dst)
         g_dw = outW;
         g_dh = (int)(outW / ar);
         if (g_dh > outH) { g_dh = outH; g_dw = (int)(outH * ar); }
-        g_dw &= ~1;
+        g_dw &= ~15; // largura múltipla de 16: caminho SIMD seguro do swscale
         g_dh &= ~1;
+        if (g_dw < 16 || g_dh < 2) return;
         g_dx = (outW - g_dw) / 2;
         g_dy = (outH - g_dh) / 2;
         std::fill(g_frame.begin(), g_frame.end(), 0xFF000000u);
+        platform::log("video %dx%d fmt=%s -> %dx%d", f->width, f->height,
+                      av_get_pix_fmt_name((AVPixelFormat)f->format), g_dw, g_dh);
         g_lastSrcW = f->width;
         g_lastSrcH = f->height;
         g_lastSrcFmt = f->format;
@@ -790,7 +799,7 @@ static void convertFrame(AVFrame* f, SDL_Surface* dst)
     AVPixelFormat outFmt = dst->format->Rmask == 0x000000FF ? AV_PIX_FMT_RGBA : AV_PIX_FMT_BGRA;
     g_sws = sws_getCachedContext(g_sws, f->width, f->height, (AVPixelFormat)f->format, g_dw, g_dh, outFmt,
                                  SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
-    if (!g_sws) return;
+    if (!g_sws) { platform::log("sws_getCachedContext falhou"); return; }
     uint8_t* dstData[4] = {(uint8_t*)&g_frame[(size_t)g_dy * outW + g_dx], nullptr, nullptr, nullptr};
     int dstLines[4] = {outW * 4, 0, 0, 0};
     sws_scale(g_sws, f->data, f->linesize, 0, f->height, dstData, dstLines);
