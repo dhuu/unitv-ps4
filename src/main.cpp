@@ -9,13 +9,12 @@
 #include "screens.h"
 #include "player.h"
 #include "crash.h"
+#include "platform.h"
 
 #include <orbis/SystemService.h>
 
-int main(int argc, char* argv[])
+static void appMain()
 {
-    (void)argc;
-    (void)argv;
     platform::init();
     platform::log("Iniciando UnitV Pro");
     crash::install();
@@ -38,6 +37,16 @@ int main(int argc, char* argv[])
     player::close();
     gfx::shutdown();
     sceSystemServiceLoadExec("exit", NULL);
+    for (;;) platform::sleepMs(1000);
+}
+
+int main(int argc, char* argv[])
+{
+    (void)argc;
+    (void)argv;
+    // A thread principal do processo tem pilha limitada: a interface + conversão de vídeo
+    // rodam numa thread com pilha de 8 MB.
+    if (!platform::startThread(appMain, 8 * 1024 * 1024)) appMain();
     for (;;) platform::sleepMs(1000);
     return 0;
 }

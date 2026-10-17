@@ -9,6 +9,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <cstdarg>
+#include <cstdio>
 #include <cmath>
 #include <deque>
 #include <vector>
@@ -47,6 +49,17 @@ extern "C" int unitv_pthread_create(pthread_t* t, const pthread_attr_t* a, void*
 }
 
 namespace player {
+
+// Mensagens de erro/aviso do FFmpeg (inclui "Assertion ... failed" antes de um abort) vão para o log
+static void ffLogCb(void*, int level, const char* fmt, va_list vl)
+{
+    if (level > AV_LOG_WARNING) return;
+    char buf[512];
+    vsnprintf(buf, sizeof(buf), fmt, vl);
+    size_t n = strlen(buf);
+    while (n && (buf[n - 1] == 10 || buf[n - 1] == 13)) buf[--n] = 0;
+    if (n) platform::log("ffmpeg[%d]: %s", level, buf);
+}
 
 // ---------------------------------------------------------------------------
 // Threads com pilha grande (a pilha padrão do musl é pequena para decodificação)
@@ -688,6 +701,8 @@ bool open(const std::string& url)
     g_state = (int)State::Opening;
     platform::log("abrindo player (mem livre %d MB)", platform::freeMemoryMB());
     g_active = true;
+    static bool logSet = false;
+    if (!logSet) { logSet = true; av_log_set_callback(ffLogCb); }
     g_openThread.start([url] { openWorker(url); });
     return true;
 }

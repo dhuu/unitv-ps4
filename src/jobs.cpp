@@ -1,4 +1,5 @@
 #include "jobs.h"
+#include "platform.h"
 
 #include <deque>
 #include <vector>
@@ -35,7 +36,7 @@ static void worker()
 
 void init(int threads)
 {
-    for (int i = 0; i < threads; i++) std::thread(worker).detach();
+    for (int i = 0; i < threads; i++) platform::startThread(worker, 512 * 1024);
 }
 
 void run(std::function<void()> work, std::function<void()> done)

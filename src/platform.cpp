@@ -5,6 +5,7 @@
 #include <cstring>
 #include <ctime>
 #include <sys/stat.h>
+#include <pthread.h>
 
 #include <orbis/libkernel.h>
 #include <orbis/Sysmodule.h>
@@ -117,6 +118,32 @@ bool writeFile(const std::string& path, const std::string& data)
     if (!ok) return false;
     remove(path.c_str());
     return rename(tmp.c_str(), path.c_str()) == 0;
+}
+
+static void* threadEntry(void* p)
+{
+    std::function<void()>* fn = (std::function<void()>*)p;
+    (*fn)();
+    delete fn;
+    return nullptr;
+}
+
+bool startThread(std::function<void()> fn, size_t stackBytes)
+{
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, stackBytes);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    pthread_t t;
+    auto* heapFn = new std::function<void()>(std::move(fn));
+    int r = pthread_create(&t, &attr, threadEntry, heapFn);
+    pthread_attr_destroy(&attr);
+    if (r != 0) {
+        delete heapFn;
+        log("pthread_create falhou (%d)", r);
+        return false;
+    }
+    return true;
 }
 
 void ensureDir(const std::string& path)

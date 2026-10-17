@@ -5,6 +5,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <exception>
+#include <pthread.h>
 
 extern "C" {
 typedef void (*OrbisExceptionHandler)(int, void*);
@@ -36,7 +38,7 @@ static void handler(int sig, void* ctx)
 {
     Ucontext* uc = (Ucontext*)ctx;
     const Mcontext& m = uc->mc;
-    platform::log("==== CRASH sinal %d ====", sig);
+    platform::log("==== CRASH sinal %d (thread %p) ====", sig, (void*)pthread_self());
     platform::log("rip=%016llx addr=%016llx rsp=%016llx rbp=%016llx", (unsigned long long)m.rip,
                   (unsigned long long)m.addr, (unsigned long long)m.rsp, (unsigned long long)m.rbp);
     platform::log("rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx rdi=%016llx rsi=%016llx",
@@ -59,10 +61,25 @@ static void handler(int sig, void* ctx)
     sceKernelRemoveExceptionHandler(sig);
 }
 
+static void onTerminate()
+{
+    platform::log("==== CRASH: std::terminate (excecao C++ nao tratada) ====");
+    try {
+        std::exception_ptr e = std::current_exception();
+        if (e) std::rethrow_exception(e);
+    } catch (const std::exception& ex) {
+        platform::log("excecao: %s", ex.what());
+    } catch (...) {
+        platform::log("excecao desconhecida");
+    }
+    abort();
+}
+
 void install()
 {
     g_base = (uint64_t)(void*)&install;
-    const int sigs[] = {4 /*SIGILL*/, 8 /*SIGFPE*/, 10 /*SIGBUS*/, 11 /*SIGSEGV*/};
+    std::set_terminate(onTerminate);
+    const int sigs[] = {4 /*SIGILL*/, 6 /*SIGABRT*/, 8 /*SIGFPE*/, 10 /*SIGBUS*/, 11 /*SIGSEGV*/};
     for (int s : sigs) {
         int r = sceKernelInstallExceptionHandler(s, handler);
         if (r < 0) platform::log("exception handler %d: 0x%08X", s, r);

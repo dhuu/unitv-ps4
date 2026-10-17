@@ -462,7 +462,7 @@ static void worker()
 
 void init()
 {
-    for (int i = 0; i < 3; i++) std::thread(worker).detach();
+    for (int i = 0; i < 3; i++) platform::startThread(worker, 512 * 1024);
 }
 
 static void evict()
