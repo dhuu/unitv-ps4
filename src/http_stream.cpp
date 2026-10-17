@@ -18,6 +18,9 @@ typedef int32_t (*SetTimeoutFn)(int32_t, uint32_t);
 
 static int skipSsl(int, unsigned int, void* const[], int, void*) { return 1; }
 
+static std::string g_lastErr;
+std::string lastStreamError() { return g_lastErr; }
+
 static uint64_t parseTotal(const char* hdr, size_t len, uint64_t from, int status)
 {
     std::string h(hdr ? hdr : "", hdr ? len : 0);
@@ -62,10 +65,22 @@ bool streamOpen(Stream& st, const std::string& url, uint64_t from)
     sceHttpAddRequestHeader(st.req, "Range", range, 0);
     sceHttpAddRequestHeader(st.req, "Accept", "*/*", 0);
     int ret = sceHttpSendRequest(st.req, NULL, 0);
-    if (ret < 0) { platform::log("stream send 0x%08X", ret); streamClose(st); return false; }
+    if (ret < 0) {
+        char e[64];
+        snprintf(e, sizeof(e), "falha de rede 0x%08X", (unsigned)ret);
+        g_lastErr = e;
+        platform::log("stream send 0x%08X", ret);
+        streamClose(st);
+        return false;
+    }
     int32_t status = 0;
     sceHttpGetStatusCode(st.req, &status);
-    if (status != 200 && status != 206) { platform::log("stream HTTP %d", status); streamClose(st); return false; }
+    if (status != 200 && status != 206) {
+        g_lastErr = "HTTP " + std::to_string(status);
+        platform::log("stream HTTP %d", status);
+        streamClose(st);
+        return false;
+    }
     char* hdr = nullptr;
     size_t hlen = 0;
     if (sceHttpGetAllResponseHeaders(st.req, &hdr, &hlen) >= 0) st.total = parseTotal(hdr, hlen, from, status);

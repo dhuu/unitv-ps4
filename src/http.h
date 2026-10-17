@@ -34,6 +34,7 @@ struct Stream {
     bool open = false;
 };
 bool streamOpen(Stream& st, const std::string& url, uint64_t from);
+std::string lastStreamError(); // diagnóstico da última falha de streamOpen
 int streamRead(Stream& st, void* buf, uint32_t len); // bytes lidos, 0 = fim, <0 = erro
 void streamClose(Stream& st);
 

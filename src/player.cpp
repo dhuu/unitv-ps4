@@ -212,6 +212,30 @@ static void audioLoop()
 // Callbacks de "arquivo" do AvPlayer apontando para o RangeFile (HTTP Range)
 // Callbacks de "arquivo" do AvPlayer apontando para o RangeFile (HTTP Range)
 static std::atomic<int> g_reads{0}, g_readFails{0};
+
+// Log interno do AvPlayer: guarda as últimas linhas para mostrar no erro
+static std::mutex g_logMtx;
+static std::vector<std::string> g_avLog;
+static int avLogCb(void*, const char* fmt, va_list args)
+{
+    char buf[256];
+    vsnprintf(buf, sizeof(buf), fmt, args);
+    size_t n = strlen(buf);
+    while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
+    if (!n) return 0;
+    platform::log("AvPlayer: %s", buf);
+    std::lock_guard<std::mutex> lk(g_logMtx);
+    g_avLog.push_back(buf);
+    if (g_avLog.size() > 6) g_avLog.erase(g_avLog.begin());
+    return 0;
+}
+static std::string avLogTail()
+{
+    std::lock_guard<std::mutex> lk(g_logMtx);
+    std::string out;
+    for (auto& l : g_avLog) out += "> " + l.substr(0, 90) + "\n";
+    return out;
+}
 static int32_t fileOpenCb(void*, const char* name)
 {
     platform::log("AvPlayer abriu arquivo virtual: %s", name ? name : "(null)");
@@ -278,7 +302,7 @@ static SceAvPlayerHandle createPlayer(bool withFile)
         init.fileReplacement.readOffset = fileReadCb;
         init.fileReplacement.size = fileSizeCb;
     }
-    init.debugLevel = 0;
+    init.debugLevel = 3; // log completo (vai para /data/UnitVPro/log.txt)
     init.basePriority = 700;
     init.numOutputVideoFramebuffers = 2;
     init.autoStart = true;
@@ -318,6 +342,11 @@ static void succeed(SceAvPlayerHandle h)
 static void openWorker(std::string url)
 {
     std::string diag;
+    {
+        std::lock_guard<std::mutex> lk(g_logMtx);
+        g_avLog.clear();
+    }
+    sceAvPlayerSetLogCallback(avLogCb, nullptr);
     auto note = [&](const std::string& line) {
         platform::log("%s", line.c_str());
         diag += line + "\n";
@@ -325,16 +354,15 @@ static void openWorker(std::string url)
     bool hls = hasExt(url, ".m3u8");
     note(std::string("Link: ") + (hls ? "HLS (.m3u8)" : (hasExt(url, ".ts") ? "MPEG-TS (.ts)" : "arquivo")));
 
-    // Resolve redirecionamentos (o player do sistema pode não segui-los)
-    std::string finalUrl = http::resolveRedirects(url);
-    if (finalUrl != url) note("Redirecionado para outro servidor");
+    // Usa sempre o link original: os links de redirecionamento do Xtream têm token de uso único
+    const std::string& finalUrl = url;
 
     if (!hls && !hasExt(url, ".ts")) {
         // ---- Filme/episódio: o app baixa por faixas e entrega ao AvPlayer como arquivo
         g_file.reset(new http::RangeFile());
         if (!g_file->open(finalUrl)) {
             g_file.reset();
-            note("Conexão HTTP com o vídeo falhou");
+            note("Conexão HTTP com o vídeo falhou: " + http::lastStreamError());
             setError("Não foi possível conectar ao vídeo.\n\n" + diag);
             g_opening = false;
             return;
@@ -375,7 +403,7 @@ static void openWorker(std::string url)
         std::string msg = "O player do PS4 não conseguiu abrir este vídeo.";
         if (fmt == "MKV" || fmt == "AVI")
             msg += "\nO arquivo está em " + fmt + ", formato que o player do PS4 não reproduz (só MP4 e HLS).";
-        setError(msg + "\n\n" + diag);
+        setError(msg + "\n\n" + diag + avLogTail());
         g_opening = false;
         return;
     }
@@ -383,7 +411,14 @@ static void openWorker(std::string url)
     // ---- Ao vivo (HLS/TS)
     http::Response probe = http::get(finalUrl, 64 * 1024, 15);
     std::string fmt = detectFormat((const uint8_t*)probe.body.data(), (int)probe.body.size());
-    note("Servidor: HTTP " + std::to_string(probe.status) + "  |  Conteúdo: " + fmt);
+    std::string first;
+    for (size_t i = 0; i < probe.body.size() && i < 8; i++) {
+        char b[4];
+        snprintf(b, sizeof(b), "%02X ", (unsigned char)probe.body[i]);
+        first += b;
+    }
+    note("Servidor: HTTP " + std::to_string(probe.status) + "  |  " + fmt + "  |  " +
+         std::to_string(probe.body.size()) + " bytes  [" + first + "]");
 
     SceAvPlayerHandle h = createPlayer(false);
     if (!h) {
@@ -408,7 +443,7 @@ static void openWorker(std::string url)
         note("AddSource (sem PostInit): " + hex(r));
         sceAvPlayerClose(h);
     }
-    setError("O player do PS4 não conseguiu abrir este canal.\n\n" + diag);
+    setError("O player do PS4 não conseguiu abrir este canal.\n\n" + diag + avLogTail());
     g_opening = false;
 }
 

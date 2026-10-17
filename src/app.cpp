@@ -101,21 +101,21 @@ void quit() { g_running = false; }
 static void drawDialog(const Dialog& d)
 {
     gfx::fillRect(0, 0, SCREEN_W, SCREEN_H, {0, 0, 0, 160});
-    int w = 980;
-    int textH = 0;
-    // estimativa de altura do texto
-    {
-        int lines = 1, acc = 0;
-        for (char c : d.msg) { if (c == '\n') { lines++; acc = 0; } else if (++acc > 60) { lines++; acc = 0; } }
-        if (lines > 12) lines = 12;
-        textH = lines * 40;
-    }
+    // estimativa de linhas; mensagens longas (diagnóstico) usam fonte menor e caixa mais larga
+    int lines = 1, acc = 0;
+    for (char c : d.msg) { if (c == '\n') { lines++; acc = 0; } else if (++acc > 60) { lines++; acc = 0; } }
+    bool big = lines > 10;
+    int w = big ? 1500 : 980;
+    int fs = big ? 22 : 28;
+    int maxLines = big ? 24 : 12;
+    if (lines > maxLines) lines = maxLines;
+    int textH = lines * (fs + 8);
     int h = 220 + textH;
     int x = (SCREEN_W - w) / 2, y = (SCREEN_H - h) / 2;
     gfx::fillRect(x, y, w, h, col::panel2);
     gfx::fillRect(x, y, w, 6, col::accent);
     gfx::text(d.title, x + 40, y + 36, 38, col::text, true, w - 80);
-    gfx::textWrapped(d.msg, x + 40, y + 100, w - 80, 28, col::dim, 12);
+    gfx::textWrapped(d.msg, x + 40, y + 100, w - 80, fs, col::dim, maxLines);
     int bw = 240, bh = 64, gap = 24;
     int total = (int)d.buttons.size() * bw + ((int)d.buttons.size() - 1) * gap;
     int bx = x + (w - total) / 2, by = y + h - bh - 30;

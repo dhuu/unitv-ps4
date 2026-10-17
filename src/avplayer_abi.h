@@ -3,6 +3,7 @@
 // então as estruturas abaixo seguem a ABI documentada pelo projeto shadPS4 (avplayer.h).
 #include <stdint.h>
 #include <stddef.h>
+#include <stdarg.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -199,6 +200,9 @@ int32_t sceAvPlayerResume(SceAvPlayerHandle h);
 int32_t sceAvPlayerStart(SceAvPlayerHandle h);
 int32_t sceAvPlayerStop(SceAvPlayerHandle h);
 int32_t sceAvPlayerStreamCount(SceAvPlayerHandle h);
+
+typedef int (*SceAvPlayerLogCallback)(void* userData, const char* format, va_list args);
+int32_t sceAvPlayerSetLogCallback(SceAvPlayerLogCallback cb, void* userData);
 
 #ifdef __cplusplus
 }
