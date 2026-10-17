@@ -74,6 +74,17 @@ jobs:
       - name: Compilar
         run: make -j"$(nproc)" CCX=clang++-18 LD=ld.lld-18 PKGTOOL="dotnet $OO_PS4_TOOLCHAIN/bin/windows/PkgTool.Core.dll"
 
+      - name: Mapa de símbolos (para traduzir endereços de crash do log)
+        run: llvm-nm-18 -n -C build/UnitVPro.elf > build/UnitVPro.map
+
+      - name: Enviar ELF + mapa (artifact de depuração)
+        uses: actions/upload-artifact@v4
+        with:
+          name: UnitVPro-PS4-debug
+          path: |
+            build/UnitVPro.elf
+            build/UnitVPro.map
+
       - name: Enviar PKG (artifact)
         uses: actions/upload-artifact@v4
         with:
