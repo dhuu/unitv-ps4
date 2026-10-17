@@ -28,6 +28,7 @@ extern "C" {
 }
 
 #include <orbis/AudioOut.h>
+#include <orbis/UserService.h>
 
 namespace player {
 
@@ -95,6 +96,8 @@ static double g_clockPts = 0;        // segundos
 static uint64_t g_clockAt = 0;       // ticks em que g_clockPts foi medido
 static bool g_clockReady = false;
 static int g_clockSerial = -1;
+static std::atomic<bool> g_videoMaster{false}; // áudio ausente/travado: vídeo dita o relógio
+static uint64_t g_firstFrameAt = 0;
 
 // saída de vídeo (ARGB na resolução da tela)
 static std::vector<uint32_t> g_frame;
@@ -343,8 +346,11 @@ static bool getClock(double& out)
     std::lock_guard<std::mutex> lk(g_clockMtx);
     if (!g_clockReady || g_clockSerial != g_serial) return false;
     double elapsed = g_paused ? 0.0 : (double)(platform::ticksMs() - g_clockAt) / 1000.0;
-    // com áudio, o relógio é atualizado a cada ~21 ms; limita a extrapolação
-    if (g_aidx >= 0 && elapsed > 0.25) elapsed = 0.25;
+    // com áudio o relógio é atualizado a cada ~21 ms; se parar por mais de 1 s, o vídeo assume
+    if (g_aidx >= 0 && !g_videoMaster && elapsed > 1.0) {
+        platform::log("audio parou de atualizar o relogio: video assume");
+        g_videoMaster = true;
+    }
     out = g_clockPts + elapsed;
     return true;
 }
@@ -454,12 +460,25 @@ static void audioLoop()
         // envia o que já está pronto
         if (pending.size() >= (size_t)kGrain * 2) {
             if (port < 0) {
-                port = sceAudioOutOpen(platform::userId(), ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, kGrain, 48000,
-                                       ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
-                if (port < 0) { platform::log("sceAudioOutOpen 0x%08X", port); platform::sleepMs(100); continue; }
+                port = sceAudioOutOpen(ORBIS_USER_SERVICE_USER_ID_SYSTEM, ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, kGrain,
+                                       48000, ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+                if (port < 0) {
+                    platform::log("sceAudioOutOpen(sistema) 0x%08X", port);
+                    port = sceAudioOutOpen(platform::userId(), ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, kGrain, 48000,
+                                           ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+                }
+                if (port < 0) {
+                    platform::log("sceAudioOutOpen 0x%08X: sem som", port);
+                    g_videoMaster = true;
+                    // sem saída de áudio: descarta e continua (o vídeo segue sozinho)
+                    pending.clear();
+                    platform::sleepMs(20);
+                    continue;
+                }
+                platform::log("audio aberto (porta %d)", port);
             }
             sceAudioOutOutput(port, pending.data()); // bloqueia ~21 ms: dá o ritmo
-            if (serial == g_serial) setClock(pendingPts, serial);
+            if (serial == g_serial && !g_videoMaster) setClock(pendingPts, serial);
             pending.erase(pending.begin(), pending.begin() + kGrain * 2);
             pendingPts += (double)kGrain / 48000.0;
             continue;
@@ -627,6 +646,8 @@ bool open(const std::string& url)
     g_durationMs = 0;
     g_seekShowMs = -1;
     resetClock();
+    g_videoMaster = false;
+    g_firstFrameAt = 0;
     g_state = (int)State::Opening;
     g_active = true;
     g_openThread.start([url] { openWorker(url); });
@@ -791,8 +812,13 @@ void render(SDL_Surface* dst)
             }
             double clock;
             bool haveClock = getClock(clock);
+            if (!haveClock && g_aidx >= 0 && g_hasFrame && g_firstFrameAt &&
+                platform::ticksMs() - g_firstFrameAt > 1200) {
+                platform::log("audio nao iniciou: video assume o relogio");
+                g_videoMaster = true;
+            }
             if (!haveClock) {
-                if (g_aidx < 0) {
+                if (g_aidx < 0 || g_videoMaster) {
                     // sem áudio: o vídeo dita o relógio
                     setClock(v.pts, v.serial);
                     haveClock = getClock(clock);
@@ -813,7 +839,7 @@ void render(SDL_Surface* dst)
                 continue;
             }
             // salto de timestamp em transmissão sem áudio: realinha o relógio
-            if (v.pts - clock > 3.0 && g_aidx < 0) setClock(v.pts, v.serial);
+            if (v.pts - clock > 3.0 && (g_aidx < 0 || g_videoMaster)) setClock(v.pts, v.serial);
             break;
         }
         g_fqCv.notify_all();
@@ -821,6 +847,7 @@ void render(SDL_Surface* dst)
     if (show) {
         convertFrame(show, dst);
         av_frame_free(&show);
+        if (!g_firstFrameAt) g_firstFrameAt = platform::ticksMs();
     }
 
     if (g_hasFrame && g_frameW == dst->w && g_frameH == dst->h) {
