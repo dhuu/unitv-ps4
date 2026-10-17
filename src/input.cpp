@@ -17,16 +17,17 @@ static const int kMaxButtons = 32;
 static SDL_Joystick* g_joy = nullptr;
 static bool g_prevBtn[kMaxButtons] = {false};
 
-// Direções só pelo direcional (o analógico é ignorado). O SDL informa o direcional
-// de dois jeitos, botões e hat; cada um tem a própria detecção de "apertou agora",
-// então um deles preso numa direção não bloqueia os toques seguintes.
-enum { SRC_BTN = 0, SRC_HAT = 1, SRC_COUNT = 2 };
-static Btn g_src[SRC_COUNT] = {Btn::None, Btn::None};
+// Direções só pelo direcional (o analógico é ignorado). Os toques vêm da fila de
+// eventos do SDL, então nenhum se perde mesmo quando um quadro demora a desenhar.
+// O SDL do PS4 informa o direcional de dois jeitos (botões 13-16 e hat): assim que
+// chega o primeiro evento de botão do direcional, o hat passa a ser ignorado, para
+// cada toque contar uma vez só.
+enum { SRC_BTN = 0, SRC_HAT = 1 };
+static bool g_dpadButtons = false; // já chegaram eventos de botão do direcional
+static Btn g_hatLast = Btn::None;
 static Btn g_held = Btn::None;     // direção que está repetindo
 static int g_heldSrc = -1;         // fonte que iniciou a repetição
 static uint64_t g_nextRepeat = 0;
-static Btn g_lastEdge = Btn::None; // último toque emitido (descarta duplicado de outra fonte)
-static uint64_t g_lastEdgeAt = 0;
 
 void init()
 {
@@ -64,36 +65,73 @@ static const char* dirName(Btn d)
     }
 }
 
-// Lê a direção de cada fonte neste quadro
-static void readDirections(Btn out[SRC_COUNT], int& hatRaw)
+static Btn hatDir(Uint8 h)
 {
-    for (int i = 0; i < SRC_COUNT; i++) out[i] = Btn::None;
-    hatRaw = 0;
-    if (!g_joy) return;
-    if (SDL_JoystickNumButtons(g_joy) > PAD_RIGHT) {
-        if (SDL_JoystickGetButton(g_joy, PAD_UP)) out[SRC_BTN] = Btn::Up;
-        else if (SDL_JoystickGetButton(g_joy, PAD_DOWN)) out[SRC_BTN] = Btn::Down;
-        else if (SDL_JoystickGetButton(g_joy, PAD_LEFT)) out[SRC_BTN] = Btn::Left;
-        else if (SDL_JoystickGetButton(g_joy, PAD_RIGHT)) out[SRC_BTN] = Btn::Right;
+    if (h & SDL_HAT_UP) return Btn::Up;
+    if (h & SDL_HAT_DOWN) return Btn::Down;
+    if (h & SDL_HAT_LEFT) return Btn::Left;
+    if (h & SDL_HAT_RIGHT) return Btn::Right;
+    return Btn::None;
+}
+
+static Btn dpadButtonDir(int b)
+{
+    switch (b) {
+    case PAD_UP: return Btn::Up;
+    case PAD_DOWN: return Btn::Down;
+    case PAD_LEFT: return Btn::Left;
+    case PAD_RIGHT: return Btn::Right;
+    default: return Btn::None;
     }
-    if (SDL_JoystickNumHats(g_joy) > 0) {
-        Uint8 h = SDL_JoystickGetHat(g_joy, 0);
-        hatRaw = h;
-        if (h & SDL_HAT_UP) out[SRC_HAT] = Btn::Up;
-        else if (h & SDL_HAT_DOWN) out[SRC_HAT] = Btn::Down;
-        else if (h & SDL_HAT_LEFT) out[SRC_HAT] = Btn::Left;
-        else if (h & SDL_HAT_RIGHT) out[SRC_HAT] = Btn::Right;
-    }
+}
+
+// Direção que a fonte informa agora (para a auto-repetição)
+static Btn heldNow(int src)
+{
+    if (!g_joy) return Btn::None;
+    if (src == SRC_HAT) return SDL_JoystickNumHats(g_joy) > 0 ? hatDir(SDL_JoystickGetHat(g_joy, 0)) : Btn::None;
+    if (SDL_JoystickNumButtons(g_joy) <= PAD_RIGHT) return Btn::None;
+    for (int b = PAD_UP; b <= PAD_RIGHT; b++)
+        if (SDL_JoystickGetButton(g_joy, b)) return dpadButtonDir(b);
+    return Btn::None;
 }
 
 std::vector<Btn> poll()
 {
     std::vector<Btn> out;
+    uint64_t now = platform::ticksMs();
+    auto press = [&](Btn d, int src) {
+        out.push_back(d);
+        g_held = d;
+        g_heldSrc = src;
+        g_nextRepeat = now + 380;
+    };
     SDL_Event ev;
     while (SDL_PollEvent(&ev)) {
         if (ev.type == SDL_JOYDEVICEADDED && !g_joy) {
             g_joy = SDL_JoystickOpen(0);
             for (bool& b : g_prevBtn) b = false;
+        } else if (ev.type == SDL_JOYBUTTONDOWN) {
+            Btn d = dpadButtonDir(ev.jbutton.button);
+            if (d == Btn::None) continue;
+            platform::log("direcional: botao %s", dirName(d));
+            if (!g_dpadButtons) {
+                g_dpadButtons = true;
+                platform::log("direcional: usando botoes, hat ignorado");
+                // o mesmo toque já pode ter chegado pelo hat neste quadro
+                if (!out.empty() && out.back() == d && g_heldSrc == SRC_HAT) {
+                    g_heldSrc = SRC_BTN;
+                    continue;
+                }
+            }
+            press(d, SRC_BTN);
+        } else if (ev.type == SDL_JOYHATMOTION && ev.jhat.hat == 0) {
+            Btn d = hatDir(ev.jhat.value);
+            bool isNew = d != Btn::None && d != g_hatLast;
+            g_hatLast = d;
+            if (!isNew || g_dpadButtons) continue;
+            platform::log("direcional: hat %s", dirName(d));
+            press(d, SRC_HAT);
         }
     }
     if (!g_joy) return out;
@@ -111,37 +149,9 @@ std::vector<Btn> poll()
         g_prevBtn[i] = down;
     }
 
-    // direções: estado atual de cada fonte, com borda de subida por fonte
-    uint64_t now = platform::ticksMs();
-    Btn cur[SRC_COUNT];
-    int hatRaw;
-    readDirections(cur, hatRaw);
-
-    bool changed = false;
-    for (int s = 0; s < SRC_COUNT; s++) {
-        if (cur[s] == g_src[s]) continue;
-        changed = true;
-        Btn d = cur[s];
-        g_src[s] = d;
-        if (d == Btn::None) continue;
-        // o mesmo toque costuma chegar como botão e como hat: só conta uma vez
-        if (d == g_lastEdge && now - g_lastEdgeAt < 120) {
-            if (g_held == d && cur[g_heldSrc] != d) g_heldSrc = s;
-            continue;
-        }
-        out.push_back(d);
-        g_lastEdge = d;
-        g_lastEdgeAt = now;
-        g_held = d;
-        g_heldSrc = s;
-        g_nextRepeat = now + 380;
-    }
-    if (changed)
-        platform::log("direcional: botoes=%s hat=%s(%d)", dirName(cur[SRC_BTN]), dirName(cur[SRC_HAT]), hatRaw);
-
     // auto-repetição enquanto a fonte que iniciou continua segurando
     if (g_held != Btn::None) {
-        if (g_heldSrc < 0 || cur[g_heldSrc] != g_held) {
+        if (heldNow(g_heldSrc) != g_held) {
             g_held = Btn::None;
             g_heldSrc = -1;
         } else if (now >= g_nextRepeat) {
