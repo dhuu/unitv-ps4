@@ -28,6 +28,14 @@ static uint64_t g_nextRepeat = 0;
 static Btn g_lastEdge = Btn::None; // último toque emitido (descarta duplicado de outra fonte)
 static uint64_t g_lastEdgeAt = 0;
 
+void init()
+{
+    if (SDL_NumJoysticks() > 0) g_joy = SDL_JoystickOpen(0);
+    if (!g_joy) platform::log("Nenhum controle encontrado");
+    else platform::log("Controle: %d botões, %d hats, %d eixos", SDL_JoystickNumButtons(g_joy),
+                       SDL_JoystickNumHats(g_joy), SDL_JoystickNumAxes(g_joy));
+}
+
 static Btn mapButton(int b)
 {
     switch (b) {
