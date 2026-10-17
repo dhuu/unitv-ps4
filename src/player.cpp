@@ -210,11 +210,20 @@ static void audioLoop()
 // --------------------------------------------------------------------------
 
 // Callbacks de "arquivo" do AvPlayer apontando para o RangeFile (HTTP Range)
-static int32_t fileOpenCb(void*, const char*) { return 0; }
+// Callbacks de "arquivo" do AvPlayer apontando para o RangeFile (HTTP Range)
+static std::atomic<int> g_reads{0}, g_readFails{0};
+static int32_t fileOpenCb(void*, const char* name)
+{
+    platform::log("AvPlayer abriu arquivo virtual: %s", name ? name : "(null)");
+    return 0;
+}
 static int32_t fileCloseCb(void*) { return 0; }
 static int32_t fileReadCb(void*, uint8_t* buf, uint64_t pos, uint32_t len)
 {
-    return g_file ? g_file->read(buf, pos, len) : -1;
+    g_reads++;
+    int n = g_file ? g_file->read(buf, pos, len) : -1;
+    if (n < 0) g_readFails++;
+    return n;
 }
 static uint64_t fileSizeCb(void*) { return g_file ? g_file->size() : 0; }
 
@@ -234,21 +243,28 @@ static bool hasExt(const std::string& url, const char* ext)
     return u.size() >= n && u.compare(u.size() - n, n, ext) == 0;
 }
 
-static void openWorker(std::string url)
+static std::string hex(int v)
 {
-    bool hls = hasExt(url, ".m3u8");
-    bool useFile = !hls && !hasExt(url, ".ts");
+    char b[16];
+    snprintf(b, sizeof(b), "0x%08X", (unsigned)v);
+    return b;
+}
 
-    if (useFile) {
-        g_file.reset(new http::RangeFile());
-        if (!g_file->open(url)) {
-            g_file.reset();
-            setError("Não foi possível conectar ao vídeo (servidor não respondeu ou link inválido).");
-            g_opening = false;
-            return;
-        }
-    }
+// Identifica o contêiner pelos primeiros bytes
+static std::string detectFormat(const uint8_t* b, int n)
+{
+    if (n >= 8 && memcmp(b + 4, "ftyp", 4) == 0) return "MP4";
+    if (n >= 8 && (memcmp(b + 4, "moov", 4) == 0 || memcmp(b + 4, "mdat", 4) == 0 || memcmp(b + 4, "free", 4) == 0)) return "MP4";
+    if (n >= 4 && b[0] == 0x1A && b[1] == 0x45 && b[2] == 0xDF && b[3] == 0xA3) return "MKV";
+    if (n >= 4 && memcmp(b, "RIFF", 4) == 0) return "AVI";
+    if (n >= 1 && b[0] == 0x47) return "MPEG-TS";
+    if (n >= 7 && memcmp(b, "#EXTM3U", 7) == 0) return "HLS";
+    if (n >= 1 && (b[0] == '<' || b[0] == '{')) return "HTML/erro do servidor";
+    return "desconhecido";
+}
 
+static SceAvPlayerHandle createPlayer(bool withFile)
+{
     SceAvPlayerInitData init;
     memset(&init, 0, sizeof(init));
     init.memoryReplacement.allocate = allocCb;
@@ -256,7 +272,7 @@ static void openWorker(std::string url)
     init.memoryReplacement.allocateTexture = allocTextureCb;
     init.memoryReplacement.deallocateTexture = freeTextureCb;
     init.eventReplacement.eventCallback = eventCb;
-    if (useFile) {
+    if (withFile) {
         init.fileReplacement.open = fileOpenCb;
         init.fileReplacement.close = fileCloseCb;
         init.fileReplacement.readOffset = fileReadCb;
@@ -267,56 +283,132 @@ static void openWorker(std::string url)
     init.numOutputVideoFramebuffers = 2;
     init.autoStart = true;
     init.defaultLanguage = "por";
+    return sceAvPlayerInit(&init);
+}
 
-    SceAvPlayerHandle h = sceAvPlayerInit(&init);
-    if (!h) {
-        setError("Falha ao iniciar o player do sistema (libSceAvPlayer).");
-        g_file.reset();
-        g_opening = false;
-        return;
-    }
+static int postInitHttp(SceAvPlayerHandle h)
+{
+    int httpCtx = 0, sslCtx = 0;
+    http::contexts(httpCtx, sslCtx);
+    SceAvPlayerPostInitData post;
+    memset(&post, 0, sizeof(post));
+    post.httpCtx.httpContextId = (uint32_t)httpCtx;
+    post.httpCtx.sslContextId = (uint32_t)sslCtx;
+    return sceAvPlayerPostInit(h, &post);
+}
 
-    int ret;
-    if (useFile) {
-        // nome "virtual": o AvPlayer lê pelos callbacks; a extensão indica o formato
-        std::string name = "/app0/stream.mp4";
-        platform::log("Abrindo (via HTTP Range): %s", url.c_str());
-        ret = sceAvPlayerAddSource(h, name.c_str());
-    } else {
-        int httpCtx = 0, sslCtx = 0;
-        http::contexts(httpCtx, sslCtx);
-        SceAvPlayerPostInitData post;
-        memset(&post, 0, sizeof(post));
-        post.httpCtx.httpContextId = (uint32_t)httpCtx;
-        post.httpCtx.sslContextId = (uint32_t)sslCtx;
-        int pr = sceAvPlayerPostInit(h, &post);
-        platform::log("sceAvPlayerPostInit 0x%08X", pr);
+static int addSourceEx(SceAvPlayerHandle h, const std::string& name, int type)
+{
+    SceAvPlayerSourceDetails sd;
+    memset(&sd, 0, sizeof(sd));
+    sd.uri.name = name.c_str();
+    sd.uri.length = (uint32_t)name.size();
+    sd.sourceType = type;
+    return sceAvPlayerAddSourceEx(h, 0, &sd);
+}
 
-        SceAvPlayerSourceDetails sd;
-        memset(&sd, 0, sizeof(sd));
-        sd.uri.name = url.c_str();
-        sd.uri.length = (uint32_t)url.size();
-        sd.sourceType = hls ? SCE_AVPLAYER_SOURCE_TYPE_HLS : SCE_AVPLAYER_SOURCE_TYPE_UNKNOWN;
-        platform::log("Abrindo (stream): %s", url.c_str());
-        ret = sceAvPlayerAddSourceEx(h, 0, &sd);
-        if (ret < 0) {
-            platform::log("AddSourceEx 0x%08X, tentando AddSource", ret);
-            ret = sceAvPlayerAddSource(h, url.c_str());
-        }
-    }
-
-    if (ret < 0) {
-        char buf[200];
-        snprintf(buf, sizeof(buf), "O player do PS4 não conseguiu abrir este vídeo (0x%08X).", ret);
-        setError(buf);
-        sceAvPlayerClose(h);
-        g_file.reset();
-        g_opening = false;
-        return;
-    }
+static void succeed(SceAvPlayerHandle h)
+{
     g_h = h;
     g_audioRun = true;
     g_audioThread = std::thread(audioLoop);
+    g_opening = false;
+}
+
+static void openWorker(std::string url)
+{
+    std::string diag;
+    auto note = [&](const std::string& line) {
+        platform::log("%s", line.c_str());
+        diag += line + "\n";
+    };
+    bool hls = hasExt(url, ".m3u8");
+    note(std::string("Link: ") + (hls ? "HLS (.m3u8)" : (hasExt(url, ".ts") ? "MPEG-TS (.ts)" : "arquivo")));
+
+    // Resolve redirecionamentos (o player do sistema pode não segui-los)
+    std::string finalUrl = http::resolveRedirects(url);
+    if (finalUrl != url) note("Redirecionado para outro servidor");
+
+    if (!hls && !hasExt(url, ".ts")) {
+        // ---- Filme/episódio: o app baixa por faixas e entrega ao AvPlayer como arquivo
+        g_file.reset(new http::RangeFile());
+        if (!g_file->open(finalUrl)) {
+            g_file.reset();
+            note("Conexão HTTP com o vídeo falhou");
+            setError("Não foi possível conectar ao vídeo.\n\n" + diag);
+            g_opening = false;
+            return;
+        }
+        uint8_t head[16] = {0};
+        int n = g_file->read(head, 0, sizeof(head));
+        std::string fmt = detectFormat(head, n);
+        char sz[64];
+        snprintf(sz, sizeof(sz), "%.1f MB", (double)g_file->size() / (1024.0 * 1024.0));
+        note("Formato: " + fmt + "  |  Tamanho: " + sz);
+
+        g_reads = 0;
+        g_readFails = 0;
+        SceAvPlayerHandle h = createPlayer(true);
+        if (h) {
+            int r = sceAvPlayerAddSource(h, "/app0/stream.mp4");
+            if (r >= 0) { succeed(h); return; }
+            note("Modo arquivo (AddSource): " + hex(r) + "  leituras " + std::to_string(g_reads.load()) +
+                 " / falhas " + std::to_string(g_readFails.load()));
+            r = addSourceEx(h, "/app0/stream.mp4", SCE_AVPLAYER_SOURCE_TYPE_FILE_MP4);
+            if (r >= 0) { succeed(h); return; }
+            note("Modo arquivo (AddSourceEx): " + hex(r));
+            sceAvPlayerClose(h);
+        } else {
+            note("sceAvPlayerInit falhou (modo arquivo)");
+        }
+        g_file.reset();
+
+        // tentativa final: o próprio AvPlayer baixa a URL
+        h = createPlayer(false);
+        if (h) {
+            note("PostInit: " + hex(postInitHttp(h)));
+            int r = sceAvPlayerAddSource(h, finalUrl.c_str());
+            if (r >= 0) { succeed(h); return; }
+            note("Modo URL: " + hex(r));
+            sceAvPlayerClose(h);
+        }
+        std::string msg = "O player do PS4 não conseguiu abrir este vídeo.";
+        if (fmt == "MKV" || fmt == "AVI")
+            msg += "\nO arquivo está em " + fmt + ", formato que o player do PS4 não reproduz (só MP4 e HLS).";
+        setError(msg + "\n\n" + diag);
+        g_opening = false;
+        return;
+    }
+
+    // ---- Ao vivo (HLS/TS)
+    http::Response probe = http::get(finalUrl, 64 * 1024, 15);
+    std::string fmt = detectFormat((const uint8_t*)probe.body.data(), (int)probe.body.size());
+    note("Servidor: HTTP " + std::to_string(probe.status) + "  |  Conteúdo: " + fmt);
+
+    SceAvPlayerHandle h = createPlayer(false);
+    if (!h) {
+        setError("Falha ao iniciar o player do sistema (libSceAvPlayer).");
+        g_opening = false;
+        return;
+    }
+    note("PostInit: " + hex(postInitHttp(h)));
+    int r = addSourceEx(h, finalUrl, hls ? SCE_AVPLAYER_SOURCE_TYPE_HLS : SCE_AVPLAYER_SOURCE_TYPE_UNKNOWN);
+    if (r >= 0) { succeed(h); return; }
+    note("AddSourceEx: " + hex(r));
+    r = sceAvPlayerAddSource(h, finalUrl.c_str());
+    if (r >= 0) { succeed(h); return; }
+    note("AddSource: " + hex(r));
+    sceAvPlayerClose(h);
+
+    // sem PostInit (player usa a própria pilha HTTP)
+    h = createPlayer(false);
+    if (h) {
+        r = sceAvPlayerAddSource(h, finalUrl.c_str());
+        if (r >= 0) { succeed(h); return; }
+        note("AddSource (sem PostInit): " + hex(r));
+        sceAvPlayerClose(h);
+    }
+    setError("O player do PS4 não conseguiu abrir este canal.\n\n" + diag);
     g_opening = false;
 }
 

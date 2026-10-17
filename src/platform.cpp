@@ -73,6 +73,18 @@ void log(const char* fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt, args);
     va_end(args);
     printf("[UnitVPro] %s\n", buf);
+    // também grava em /data/UnitVPro/log.txt (pode ser copiado via FTP para diagnóstico)
+    static FILE* lf = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        mkdir(APP_DATA_DIR, 0777);
+        lf = fopen(APP_DATA_DIR "/log.txt", "w");
+    }
+    if (lf) {
+        fprintf(lf, "[%llu] %s\n", (unsigned long long)ticksMs(), buf);
+        fflush(lf);
+    }
 }
 
 bool readFile(const std::string& path, std::string& out)

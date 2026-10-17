@@ -103,6 +103,62 @@ void streamClose(Stream& st)
     st.open = false;
 }
 
+typedef int32_t (*SetAutoRedirectFn)(int32_t, int32_t);
+
+std::string resolveRedirects(const std::string& urlIn)
+{
+    std::string url = urlIn;
+    int httpCtx, sslCtx;
+    contexts(httpCtx, sslCtx);
+    for (int hop = 0; hop < 6; hop++) {
+        int tpl = sceHttpCreateTemplate(httpCtx, UA, ORBIS_HTTP_VERSION_1_1, 1);
+        if (tpl < 0) break;
+        sceHttpsSetSslCallback(tpl, skipSsl, NULL);
+        sceHttpsDisableOption(tpl, 0x01);
+        ((SetAutoRedirectFn)(void*)&sceHttpSetAutoRedirect)(tpl, 0);
+        sceHttpSetConnectTimeOut(tpl, 15u * 1000000u);
+        ((SetTimeoutFn)(void*)&sceHttpSetRecvTimeOut)(tpl, 15u * 1000000u);
+        int conn = sceHttpCreateConnectionWithURL(tpl, url.c_str(), true);
+        int req = conn >= 0 ? sceHttpCreateRequestWithURL(conn, ORBIS_METHOD_GET, url.c_str(), 0) : -1;
+        std::string next;
+        if (req >= 0) {
+            sceHttpAddRequestHeader(req, "Range", "bytes=0-0", 0);
+            if (sceHttpSendRequest(req, NULL, 0) >= 0) {
+                int32_t status = 0;
+                sceHttpGetStatusCode(req, &status);
+                if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
+                    char* hdr = nullptr;
+                    size_t hlen = 0;
+                    if (sceHttpGetAllResponseHeaders(req, &hdr, &hlen) >= 0 && hdr) {
+                        std::string h(hdr, hlen), low = h;
+                        for (auto& c : low) c = (char)tolower((unsigned char)c);
+                        size_t p = low.find("\nlocation:");
+                        if (p == std::string::npos && low.compare(0, 9, "location:") == 0) p = 0;
+                        else if (p != std::string::npos) p += 1;
+                        if (p != std::string::npos) {
+                            size_t st = p + 9, en = h.find_first_of("\r\n", st);
+                            next = h.substr(st, en == std::string::npos ? std::string::npos : en - st);
+                            while (!next.empty() && next[0] == ' ') next.erase(0, 1);
+                        }
+                    }
+                }
+            }
+        }
+        if (req >= 0) sceHttpDeleteRequest(req);
+        if (conn >= 0) sceHttpDeleteConnection(conn);
+        sceHttpDeleteTemplate(tpl);
+        if (next.empty()) break;
+        if (next[0] == '/') { // relativo ao host
+            size_t s3 = url.find("://");
+            size_t slash = s3 == std::string::npos ? std::string::npos : url.find('/', s3 + 3);
+            next = (slash == std::string::npos ? url : url.substr(0, slash)) + next;
+        }
+        platform::log("Redirect -> %s", next.c_str());
+        url = next;
+    }
+    return url;
+}
+
 static const uint64_t kBlock = 512 * 1024;
 static const size_t kMaxBlocks = 24; // ~12 MB de cache
 

@@ -23,6 +23,8 @@ Response get(const std::string& url, size_t maxBytes = 0, int timeoutSec = 25);
 namespace http {
 
 void contexts(int& httpCtx, int& sslCtx);
+// Segue redirecionamentos 30x manualmente e retorna a URL final
+std::string resolveRedirects(const std::string& url);
 
 // Download sequencial a partir de um deslocamento (Range: bytes=from-)
 struct Stream {
