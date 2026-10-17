@@ -111,7 +111,8 @@ static uint64_t g_clockAt = 0;       // ticks em que g_clockPts foi medido
 static bool g_clockReady = false;
 static int g_clockSerial = -1;
 static std::atomic<bool> g_videoMaster{false}; // áudio ausente/travado: vídeo dita o relógio
-static uint64_t g_firstFrameAt = 0;
+static std::atomic<bool> g_audioBroken{false}; // saída de áudio não abriu
+static std::atomic<uint64_t> g_firstFrameAt{0};
 
 // saída de vídeo (ARGB na resolução da tela)
 static std::vector<uint32_t> g_frame;
@@ -390,19 +391,28 @@ static void readLoop()
             if (g_seekReq) { doSeek = true; target = g_seekTargetMs; g_seekReq = false; }
         }
         if (doSeek) {
+            platform::log("seek para %lld ms (mem livre %d MB)", (long long)target, platform::freeMemoryMB());
             int64_t ts = target * 1000 + (int64_t)(g_startTime * AV_TIME_BASE);
             int r = avformat_seek_file(g_fmt, -1, INT64_MIN, ts, INT64_MAX, 0);
-            if (r < 0) platform::log("seek falhou: %s", averr(r).c_str());
+            platform::log("seek resultado: %s", r < 0 ? averr(r).c_str() : "ok");
             g_vq.flush();
             g_aq.flush();
             g_serial++;
             clearFrames();
             resetClock();
+            g_firstFrameAt = 0;
+            if (!g_audioBroken) g_videoMaster = false;
             g_eof = false;
+            platform::log("seek concluido (serial %d)", g_serial.load());
         }
 
         if (g_eof) { platform::sleepMs(20); continue; }
 
+        static uint64_t lastMemLog = 0;
+        if (platform::ticksMs() - lastMemLog > 5000) {
+            lastMemLog = platform::ticksMs();
+            platform::log("mem livre %d MB | filas v=%zu a=%zu", platform::freeMemoryMB(), g_vq.size(), g_aq.size());
+        }
         int r = av_read_frame(g_fmt, pkt);
         if (r < 0) {
             if (g_stop) break;
@@ -484,6 +494,7 @@ static void audioLoop()
                 }
                 if (port < 0) {
                     platform::log("sceAudioOutOpen 0x%08X: sem som", port);
+                    g_audioBroken = true;
                     g_videoMaster = true;
                     // sem saída de áudio: descarta e continua (o vídeo segue sozinho)
                     pending.clear();
@@ -568,9 +579,10 @@ static AVCodecContext* openDecoder(int idx, bool video)
     avcodec_parameters_to_context(c, st->codecpar);
     c->pkt_timebase = st->time_base;
     if (video) {
-        // 4K usa menos threads (cada uma guarda quadros enormes na memória)
-        c->thread_count = st->codecpar->width > 1920 ? 4 : 6;
-        c->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+        // cada thread de quadro guarda quadros inteiros na memória: HEVC/4K usam menos threads
+        bool heavy = st->codecpar->codec_id == AV_CODEC_ID_HEVC || st->codecpar->width > 1920;
+        c->thread_count = heavy ? 3 : 6;
+        c->thread_type = heavy ? FF_THREAD_FRAME : (FF_THREAD_FRAME | FF_THREAD_SLICE);
         c->flags2 |= AV_CODEC_FLAG2_FAST;
         // 1080p ou mais em CPU: pula o deblocking dos quadros não-referência (mais leve)
         if (st->codecpar->height >= 1000) c->skip_loop_filter = AVDISCARD_NONREF;
@@ -581,7 +593,8 @@ static AVCodecContext* openDecoder(int idx, bool video)
         avcodec_free_context(&c);
         return nullptr;
     }
-    platform::log("%s: %s %dx%d", video ? "video" : "audio", codec->name, c->width, c->height);
+    platform::log("%s: %s %dx%d threads=%d (mem livre %d MB)", video ? "video" : "audio", codec->name, c->width,
+                  c->height, c->thread_count, platform::freeMemoryMB());
     return c;
 }
 
@@ -663,8 +676,10 @@ bool open(const std::string& url)
     g_seekShowMs = -1;
     resetClock();
     g_videoMaster = false;
+    g_audioBroken = false;
     g_firstFrameAt = 0;
     g_state = (int)State::Opening;
+    platform::log("abrindo player (mem livre %d MB)", platform::freeMemoryMB());
     g_active = true;
     g_openThread.start([url] { openWorker(url); });
     return true;

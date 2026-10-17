@@ -14,6 +14,7 @@ std::string macAddress();       // MAC da interface de rede no formato AA:BB:CC:
 uint64_t ticksMs();             // relógio monotônico em ms
 int64_t unixTime();             // segundos desde epoch (UTC)
 void sleepMs(uint32_t ms);
+int freeMemoryMB();             // memória flexível livre (MB), -1 se indisponível
 void log(const char* fmt, ...);
 bool readFile(const std::string& path, std::string& out);
 bool writeFile(const std::string& path, const std::string& data);

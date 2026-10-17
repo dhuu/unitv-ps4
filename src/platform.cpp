@@ -63,6 +63,16 @@ int64_t unixTime() { return (int64_t)time(NULL); }
 
 void sleepMs(uint32_t ms) { sceKernelUsleep(ms * 1000); }
 
+// O header do OpenOrbis declara o parâmetro como size_t; a assinatura real recebe um ponteiro
+typedef int32_t (*AvailFlexFn)(size_t*);
+
+int freeMemoryMB()
+{
+    size_t sz = 0;
+    if (((AvailFlexFn)(void*)&sceKernelAvailableFlexibleMemorySize)(&sz) < 0) return -1;
+    return (int)(sz / (1024 * 1024));
+}
+
 void log(const char* fmt, ...)
 {
     char buf[1024];
