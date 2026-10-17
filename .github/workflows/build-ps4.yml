@@ -23,6 +23,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Instalar .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
       - name: Instalar clang/lld 18
         run: |
           sudo apt-get update
@@ -53,8 +58,10 @@ jobs:
           cp "$OO_PS4_TOOLCHAIN"/samples/hello_world/sce_module/*.prx sce_module/
           cp "$OO_PS4_TOOLCHAIN"/samples/hello_world/sce_sys/about/right.sprx sce_sys/about/
 
+      # O PkgTool.Core de Linux é um binário .NET 3.0 que exige libssl1.1 (inexistente no Ubuntu atual).
+      # Usamos a versão portátil (PkgTool.Core.dll) rodando no .NET 8 do runner.
       - name: Compilar
-        run: make -j"$(nproc)" CCX=clang++-18 LD=ld.lld-18
+        run: make -j"$(nproc)" CCX=clang++-18 LD=ld.lld-18 PKGTOOL="dotnet $OO_PS4_TOOLCHAIN/bin/windows/PkgTool.Core.dll"
 
       - name: Enviar PKG (artifact)
         uses: actions/upload-artifact@v4
