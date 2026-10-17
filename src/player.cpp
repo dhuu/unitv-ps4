@@ -183,17 +183,30 @@ static int ioRead(void* opaque, uint8_t* buf, int size)
             if (http::streamRead(io->st, tmp, want) <= 0) { http::streamClose(io->st); break; }
         }
     }
-    if (!io->st.open || (int64_t)io->st.pos != io->pos) {
-        if (!http::streamOpen(io->st, io->url, (uint64_t)io->pos)) return g_stop ? AVERROR_EXIT : AVERROR(EIO);
-    }
-    int n = http::streamRead(io->st, buf, (uint32_t)size);
-    if (n < 0) {
+    // Conexões ociosas (buffer cheio) costumam ser fechadas pelo servidor: reconecta e
+    // continua do mesmo byte em vez de tratar a queda como fim do arquivo.
+    for (int attempt = 0; attempt < 6 && !g_stop; attempt++) {
+        if (!io->st.open || (int64_t)io->st.pos != io->pos) {
+            // ao vivo (tamanho desconhecido): reconecta do início da transmissão
+            uint64_t from = io->size >= 0 ? (uint64_t)io->pos : 0;
+            if (!http::streamOpen(io->st, io->url, from)) {
+                platform::log("reconexao %d falhou (%s)", attempt + 1, http::lastStreamError().c_str());
+                platform::sleepMs(500u * (attempt + 1));
+                continue;
+            }
+            if (io->size < 0) io->st.pos = (uint64_t)io->pos; // fluxo contínuo: só segue lendo
+        }
+        int n = http::streamRead(io->st, buf, (uint32_t)size);
+        if (n > 0) {
+            io->pos += n;
+            return n;
+        }
         http::streamClose(io->st);
-        return g_stop ? AVERROR_EXIT : AVERROR(EIO);
+        if (n == 0 && io->size >= 0 && io->pos >= io->size) return AVERROR_EOF; // fim real
+        if (g_stop) break;
+        platform::log("conexao caiu em %lld/%lld (n=%d), reconectando", (long long)io->pos, (long long)io->size, n);
     }
-    if (n == 0) return AVERROR_EOF;
-    io->pos += n;
-    return n;
+    return g_stop ? AVERROR_EXIT : AVERROR(EIO);
 }
 
 static int64_t ioSeek(void* opaque, int64_t offset, int whence)

@@ -39,6 +39,7 @@ class PlayerScreen : public Screen {
     bool started_ = false;
     bool errorShown_ = false;
     int liveRetries_ = 0;
+    int vodRetries_ = 0;
     std::vector<EpgEntry> epg_;
     int epgFor_ = 0;
     uint64_t seekAccum_ = 0;   // alvo de busca acumulado (setas repetidas)
@@ -207,6 +208,16 @@ public:
             if (isLive()) {
                 if (liveRetries_++ < 3) { openCurrent(); return; }
             } else {
+                // "terminou" muito antes do fim (queda de conexão): reabre no mesmo ponto
+                uint64_t pos = player::positionMs(), dur = player::durationMs();
+                if (dur > 0 && pos + 60000 < dur && vodRetries_ < 5) {
+                    vodRetries_++;
+                    platform::log("fim inesperado em %llu/%llu ms: reabrindo", (unsigned long long)pos,
+                                  (unsigned long long)dur);
+                    pendingSeek_ = pos > 5000 ? pos - 5000 : 0;
+                    openCurrent();
+                    return;
+                }
                 storage::clearProgress(cur().progressKey());
                 if (cur().kind == Kind::Episode && idx_ + 1 < (int)list_.size()) {
                     app::toast("Próximo episódio");
