@@ -4,7 +4,7 @@
 #define PANEL_URL "https://willgame.top/iptv/unitv-pro/"
 
 #define APP_NAME "UnitV Pro"
-#define APP_VERSION "1.0 PS4"
+#define APP_VERSION "22.0 PS4"
 
 #define SCREEN_W 1920
 #define SCREEN_H 1080
