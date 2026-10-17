@@ -95,6 +95,9 @@ struct Thread {
 static std::atomic<bool> g_stop{false};
 static std::atomic<int> g_state{(int)State::Idle};
 static std::atomic<bool> g_paused{false};
+static std::atomic<bool> g_stall{true};      // enchendo o buffer: relógio parado
+static std::atomic<double> g_stallTarget{1.5}; // segundos necessários para voltar a tocar
+static std::atomic<uint64_t> g_stallEndAt{0};  // quando o buffer ficou pronto pela última vez
 static std::atomic<bool> g_eof{false};
 static std::atomic<int> g_serial{0};
 static std::atomic<bool> g_opened{false};   // avformat aberto e threads rodando
@@ -291,6 +294,7 @@ static void abortAllIO()
 struct PktEntry {
     AVPacket* pkt; // nullptr = fim (esvaziar o decodificador)
     int serial;
+    double ts;     // carimbo de tempo (s) ou NAN
 };
 
 struct PacketQueue {
@@ -298,8 +302,9 @@ struct PacketQueue {
     size_t bytes = 0;
     std::mutex m;
     std::condition_variable cv;
-    size_t maxBytes = 8u << 20;
-    size_t maxCount = 300; // ~10 s de vídeo: limita a memória mesmo com pacotes pequenos
+    size_t maxBytes = 32u << 20;
+    size_t maxCount = 1500; // ~1 min de vídeo: limita a memória mesmo com pacotes pequenos
+    const AVRational* tb = nullptr;
 
     void push(AVPacket* p, int serial)
     {
@@ -309,7 +314,12 @@ struct PacketQueue {
         });
         // parado ou busca pendente: descarta (a busca vai esvaziar as filas de qualquer forma)
         if (g_stop || (g_seekFlag && p)) { if (p) av_packet_free(&p); return; }
-        q.push_back({p, serial});
+        double ts = NAN;
+        if (p && tb) {
+            int64_t t = p->dts != AV_NOPTS_VALUE ? p->dts : p->pts;
+            if (t != AV_NOPTS_VALUE) ts = (double)t * av_q2d(*tb);
+        }
+        q.push_back({p, serial, ts});
         if (p) bytes += (size_t)p->size;
         cv.notify_all();
     }
@@ -339,6 +349,21 @@ struct PacketQueue {
         std::lock_guard<std::mutex> lk(m);
         return q.size();
     }
+    // segundos de mídia guardados na fila
+    double duration()
+    {
+        std::lock_guard<std::mutex> lk(m);
+        double first = NAN, last = NAN;
+        for (auto& e : q) if (!std::isnan(e.ts)) { first = e.ts; break; }
+        for (auto it = q.rbegin(); it != q.rend(); ++it) if (!std::isnan(it->ts)) { last = it->ts; break; }
+        if (std::isnan(first) || std::isnan(last) || last < first) return 0.0;
+        return last - first;
+    }
+    bool full()
+    {
+        std::lock_guard<std::mutex> lk(m);
+        return bytes >= maxBytes || q.size() >= maxCount;
+    }
     void wake()
     {
         std::lock_guard<std::mutex> lk(m);
@@ -353,7 +378,7 @@ struct VFrame {
 };
 
 static PacketQueue g_vq, g_aq;
-static struct QueueInit { QueueInit() { g_aq.maxBytes = 2u << 20; g_aq.maxCount = 600; } } g_queueInit;
+static struct QueueInit { QueueInit() { g_aq.maxBytes = 6u << 20; g_aq.maxCount = 3000; } } g_queueInit;
 static std::deque<VFrame> g_fq;
 static std::mutex g_fqMtx;
 static std::condition_variable g_fqCv;
@@ -383,7 +408,7 @@ static bool getClock(double& out)
 {
     std::lock_guard<std::mutex> lk(g_clockMtx);
     if (!g_clockReady || g_clockSerial != g_serial) return false;
-    double elapsed = g_paused ? 0.0 : (double)(platform::ticksMs() - g_clockAt) / 1000.0;
+    double elapsed = (g_paused || g_stall) ? 0.0 : (double)(platform::ticksMs() - g_clockAt) / 1000.0;
     // com áudio o relógio é atualizado a cada ~21 ms; se parar por mais de 1 s, o vídeo assume
     if (g_aidx >= 0 && !g_videoMaster && elapsed > 1.0) {
         platform::log("audio parou de atualizar o relogio: video assume");
@@ -424,6 +449,8 @@ static void readLoop()
             resetClock();
             g_firstFrameAt = 0;
             if (!g_audioBroken) g_videoMaster = false;
+            g_stallTarget = 1.5;
+            g_stall = true;
             g_eof = false;
             platform::log("seek concluido (serial %d)", g_serial.load());
         }
@@ -502,7 +529,7 @@ static void audioLoop()
     std::vector<int16_t> outBuf;
 
     while (!g_stop) {
-        if (g_paused) { platform::sleepMs(10); continue; }
+        if (g_paused || g_stall) { platform::sleepMs(10); continue; }
 
         // envia o que já está pronto
         if (pending.size() >= (size_t)kGrain * 2) {
@@ -664,6 +691,8 @@ static void openWorker(std::string url)
     }
     g_vidx = vidx;
     g_aidx = aidx;
+    g_vq.tb = &g_vtb;
+    g_aq.tb = &g_atb;
     // descarta faixas que não usamos (economiza leitura)
     for (unsigned i = 0; i < g_fmt->nb_streams; i++)
         if ((int)i != vidx && (int)i != aidx) g_fmt->streams[i]->discard = AVDISCARD_ALL;
@@ -692,6 +721,8 @@ bool open(const std::string& url)
     }
     g_stop = false;
     g_paused = false;
+    g_stall = true;
+    g_stallTarget = 1.5;
     g_eof = false;
     g_hasFrame = false;
     g_durationMs = 0;
@@ -748,6 +779,7 @@ State state()
     if (s == State::Error || s == State::Idle) return s;
     if (!g_opened) return State::Opening;
     if (g_paused) return State::Paused;
+    if (g_stall && g_hasFrame) return State::Buffering;
     size_t fq;
     {
         std::lock_guard<std::mutex> lk(g_fqMtx);
@@ -864,9 +896,40 @@ static void convertFrame(AVFrame* f, SDL_Surface* dst)
     g_hasFrame = true;
 }
 
+// Pausa o relógio quando o buffer esvazia e só retoma com alguns segundos guardados
+static void updateBuffering()
+{
+    if (!g_opened) return;
+    PacketQueue& q = g_vidx >= 0 ? g_vq : g_aq;
+    double have = q.duration();
+    if (!g_stall) {
+        bool empty = g_vidx >= 0 ? (g_vq.size() == 0) : (g_aq.size() == 0);
+        size_t fq;
+        {
+            std::lock_guard<std::mutex> lk(g_fqMtx);
+            fq = g_fq.size();
+        }
+        if (empty && fq == 0 && !g_eof && g_hasFrame) {
+            double c;
+            if (getClock(c)) setClock(c, g_serial);
+            g_stallTarget = 3.0;
+            g_stall = true;
+            platform::log("buffer vazio: carregando %.1f s", g_stallTarget.load());
+        }
+    } else if (g_eof || have >= g_stallTarget || q.full()) {
+        double c;
+        bool ok = getClock(c);
+        g_stall = false;
+        g_stallEndAt = platform::ticksMs();
+        if (ok) setClock(c, g_serial);
+        platform::log("buffer pronto (%.1f s guardados)", have);
+    }
+}
+
 void render(SDL_Surface* dst)
 {
     if (!dst) return;
+    updateBuffering();
     AVFrame* show = nullptr;
     if (g_opened && g_vidx >= 0) {
         std::lock_guard<std::mutex> lk(g_fqMtx);
@@ -879,8 +942,9 @@ void render(SDL_Surface* dst)
             }
             double clock;
             bool haveClock = getClock(clock);
-            if (!haveClock && g_aidx >= 0 && g_hasFrame && g_firstFrameAt &&
-                platform::ticksMs() - g_firstFrameAt > 1200) {
+            uint64_t since = std::max<uint64_t>(g_firstFrameAt, g_stallEndAt);
+            if (!haveClock && g_aidx >= 0 && !g_stall && g_hasFrame && g_firstFrameAt &&
+                platform::ticksMs() - since > 1200) {
                 platform::log("audio nao iniciou: video assume o relogio");
                 g_videoMaster = true;
             }
