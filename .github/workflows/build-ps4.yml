@@ -31,7 +31,7 @@ jobs:
       - name: Instalar clang/lld 18
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang-18 lld-18 make
+          sudo apt-get install -y clang-18 lld-18 llvm-18 make nasm xz-utils
 
       - name: Cache do OpenOrbis Toolchain
         id: cache-oo
@@ -57,6 +57,17 @@ jobs:
           mkdir -p sce_module sce_sys/about
           cp "$OO_PS4_TOOLCHAIN"/samples/hello_world/sce_module/*.prx sce_module/
           cp "$OO_PS4_TOOLCHAIN"/samples/hello_world/sce_sys/about/right.sprx sce_sys/about/
+
+      - name: Cache do FFmpeg
+        id: cache-ffmpeg
+        uses: actions/cache@v4
+        with:
+          path: ffmpeg-ps4
+          key: ffmpeg-ps4-${{ env.OO_TOOLCHAIN_VERSION }}-${{ hashFiles('scripts/build-ffmpeg.sh') }}
+
+      - name: Compilar FFmpeg para PS4
+        if: steps.cache-ffmpeg.outputs.cache-hit != 'true'
+        run: bash scripts/build-ffmpeg.sh ffmpeg-ps4
 
       # O PkgTool.Core de Linux é um binário .NET 3.0 que exige libssl1.1 (inexistente no Ubuntu atual).
       # Usamos a versão portátil (PkgTool.Core.dll) rodando no .NET 8 do runner.
