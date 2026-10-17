@@ -378,9 +378,9 @@ class SettingsScreen : public Screen {
         r.push_back({"Vencimento", formatExp(g_account.expDate), nullptr});
         r.push_back({"Endereço MAC", platform::macAddress(), nullptr});
         r.push_back({"Servidor (DNS)", api::session().dns, [this] { nextDns(); }});
-        r.push_back({"Formato da TV ao vivo", s.liveFormat == "ts" ? "MPEG-TS (.ts)" : "HLS (.m3u8) — recomendado", [] {
+        r.push_back({"Formato da TV ao vivo", s.liveFormat == "m3u8" ? "HLS (.m3u8)" : "MPEG-TS (.ts) — recomendado", [] {
                          Settings& st = storage::settings();
-                         st.liveFormat = st.liveFormat == "ts" ? "m3u8" : "ts";
+                         st.liveFormat = st.liveFormat == "m3u8" ? "ts" : "m3u8";
                          storage::save();
                      }});
         r.push_back({"Alterar senha parental", "****", [] { changePin(); }});

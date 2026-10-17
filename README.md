@@ -2,7 +2,7 @@
 
 Versão para PlayStation 4 (homebrew) do app Android **UnitV Pro** (`com.willdev.unitvpro`).
 É um port em C++ que usa o [OpenOrbis PS4 Toolchain](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain),
-o SDL2 para desenhar a interface e o **libSceAvPlayer** (o player nativo do PS4) para tocar os vídeos.
+o SDL2 para desenhar a interface e um **player interno baseado no FFmpeg** (compilado no próprio CI por `scripts/build-ffmpeg.sh`).
 
 > **Requisito:** o PS4 precisa estar desbloqueado (GoldHEN ou outro HEN) para instalar pacotes `.pkg` fake-signed.
 
@@ -70,14 +70,10 @@ Os dados (login, favoritos, histórico, progresso) ficam em `/data/UnitVPro/sett
 
 ## Limitações conhecidas
 
-- O player do PS4 (AvPlayer) reproduz **HLS (`.m3u8`)** e **MP4 (H.264/AAC)**. Por isso a TV ao vivo usa
-  `.m3u8` por padrão. Dá para trocar para `.ts` em Ajustes, mas o AvPlayer pode não aceitar MPEG-TS direto.
-  Filmes em **MKV/AVI** ou com codecs HEVC/AC3 podem não tocar.
-- A conversão de vídeo NV12 → RGB é feita na CPU (renderizador por software do SDL). Conteúdo em 1080p60
-  pode descartar quadros.
+- A decodificação de vídeo é por software (FFmpeg, 6 threads). 720p/1080p H.264 devem rodar; HEVC 4K ou
+  1080p60 podem descartar quadros.
+- A conversão de cor e a interface usam a CPU (renderizador por software do SDL).
 - O banner TMDB, a WebView de eventos e o player "mini" das telas de detalhes do Android não foram portados.
-- As estruturas do `libSceAvPlayer` não estão nos headers do OpenOrbis; foram declaradas em
-  [`src/avplayer_abi.h`](src/avplayer_abi.h) com base na documentação do emulador shadPS4.
 
 ## Estrutura
 
@@ -93,10 +89,11 @@ src/
   gfx.*               SDL2 + FreeType + carregamento assíncrono de imagens (stb_image)
   input.*             controle DualShock 4
   ime.*               teclado virtual do sistema
-  player.*            reprodutor (libSceAvPlayer + AudioOut)
+  player.*            player interno (FFmpeg + swscale + AudioOut)
   ui.h / app.cpp      pilha de telas, diálogos, componentes
   screens_*.cpp       telas
 assets/               fontes (DejaVu) e imagens
 sce_sys/              ícone (icon0.png) e fundo (pic1.png) do PS4
 third_party/          stb_image.h
+scripts/build-ffmpeg.sh  compila o FFmpeg (LGPL) para o PS4
 ```

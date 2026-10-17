@@ -28,8 +28,6 @@ bool init()
     sceSysmoduleLoadModuleInternal(ORBIS_SYSMODULE_INTERNAL_COMMON_DIALOG);
     sceSysmoduleLoadModule(ORBIS_SYSMODULE_FREETYPE_OL);
     sceSysmoduleLoadModule(ORBIS_SYSMODULE_IME_DIALOG);
-    if (sceSysmoduleLoadModule(ORBIS_SYSMODULE_AV_PLAYER) < 0)
-        log("Falha ao carregar libSceAvPlayer");
 
     sceUserServiceInitialize(NULL);
     sceUserServiceGetInitialUser(&g_userId);

@@ -1,642 +1,826 @@
+// Player interno baseado no FFmpeg (substitui o ExoPlayer do Android e o AvPlayer do PS4).
+// Lê TS, HLS, MP4, MKV, AVI... via sceHttp (AVIOContext próprio) e decodifica H.264/HEVC/AAC/AC3 etc.
+//
+// Threads: leitura (demux) -> filas de pacotes -> decodificação de vídeo / áudio.
+// O áudio dita o relógio; a thread principal mostra o quadro de vídeo cujo horário chegou.
 #include "player.h"
-#include "avplayer_abi.h"
 #include "platform.h"
 #include "http.h"
 
-#include <cstdlib>
+#include <algorithm>
 #include <cstring>
+#include <cmath>
+#include <deque>
 #include <vector>
-#include <map>
+#include <string>
 #include <mutex>
-#include <thread>
+#include <condition_variable>
 #include <atomic>
-#include <memory>
+#include <functional>
+#include <pthread.h>
 
-#include <orbis/libkernel.h>
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libswscale/swscale.h>
+#include <libswresample/swresample.h>
+#include <libavutil/channel_layout.h>
+}
+
 #include <orbis/AudioOut.h>
 
 namespace player {
 
-static std::atomic<SceAvPlayerHandle> g_h{nullptr};
-static std::thread g_openThread;
-static std::atomic<bool> g_opening{false};
-static std::unique_ptr<http::RangeFile> g_file; // filmes/episódios: o app baixa e entrega os bytes ao AvPlayer
-static std::atomic<int> g_state{(int)State::Idle};
-static std::atomic<bool> g_audioRun{false};
-static std::thread g_audioThread;
-static std::string g_error;
-static std::mutex g_mtx;
-static uint64_t g_openedAt = 0;
-static uint64_t g_duration = 0;
-static bool g_everPlayed = false;
-static bool g_userPaused = false;
-
-// Buffer convertido (ARGB na resolução da tela) para redesenhar entre frames
-static std::vector<uint32_t> g_frame;
-static int g_frameW = 0, g_frameH = 0;
-static bool g_hasFrame = false;
-
-// --------------------------------------------------------------------------
-// Alocadores exigidos pelo AvPlayer
-// --------------------------------------------------------------------------
-static void* allocCb(void*, uint32_t align, uint32_t size)
-{
-    if (align < 16) align = 16;
-    void* p = nullptr;
-    if (posix_memalign(&p, align, size) != 0) return nullptr;
-    return p;
-}
-
-static void freeCb(void*, void* mem) { free(mem); }
-
-struct DirectBlock { off_t phys; size_t size; };
-static std::map<void*, DirectBlock> g_textures;
-static std::mutex g_texMtx;
-
-// Memória de vídeo: memória direta mapeada para CPU+GPU (o decodificador escreve nela)
-static void* allocTextureCb(void*, uint32_t align, uint32_t size)
-{
-    const size_t page = 64 * 1024;
-    size_t sz = ((size_t)size + page - 1) & ~(page - 1);
-    size_t al = align < page ? page : align;
-    off_t phys = 0;
-    int ret = sceKernelAllocateDirectMemory(0, sceKernelGetDirectMemorySize(), sz, al, ORBIS_KERNEL_WC_GARLIC, &phys);
-    if (ret < 0) { platform::log("AllocateDirectMemory 0x%08X", ret); return nullptr; }
-    void* addr = nullptr;
-    ret = sceKernelMapDirectMemory(&addr, sz, ORBIS_KERNEL_PROT_CPU_RW | ORBIS_KERNEL_PROT_GPU_RW, 0, phys, al);
-    if (ret < 0) {
-        platform::log("MapDirectMemory 0x%08X", ret);
-        sceKernelReleaseDirectMemory(phys, sz);
+// ---------------------------------------------------------------------------
+// Threads com pilha grande (a pilha padrão do musl é pequena para decodificação)
+// ---------------------------------------------------------------------------
+struct Thread {
+    pthread_t t{};
+    bool running = false;
+    std::function<void()> fn;
+    static void* entry(void* p)
+    {
+        static_cast<Thread*>(p)->fn();
         return nullptr;
     }
-    std::lock_guard<std::mutex> lk(g_texMtx);
-    g_textures[addr] = {phys, sz};
-    return addr;
+    void start(std::function<void()> f)
+    {
+        fn = std::move(f);
+        pthread_attr_t attr;
+        pthread_attr_init(&attr);
+        pthread_attr_setstacksize(&attr, 2 * 1024 * 1024);
+        running = pthread_create(&t, &attr, entry, this) == 0;
+        pthread_attr_destroy(&attr);
+    }
+    void join()
+    {
+        if (running) pthread_join(t, nullptr);
+        running = false;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Estado global do player
+// ---------------------------------------------------------------------------
+static std::atomic<bool> g_stop{false};
+static std::atomic<int> g_state{(int)State::Idle};
+static std::atomic<bool> g_paused{false};
+static std::atomic<bool> g_eof{false};
+static std::atomic<int> g_serial{0};
+static std::atomic<bool> g_opened{false};   // avformat aberto e threads rodando
+static std::atomic<bool> g_active{false};   // open() chamado e ainda não fechado
+static std::mutex g_errMtx;
+static std::string g_error;
+
+static AVFormatContext* g_fmt = nullptr;
+static AVIOContext* g_mainIO = nullptr;
+static AVCodecContext* g_vdec = nullptr;
+static AVCodecContext* g_adec = nullptr;
+static std::atomic<int> g_vidx{-1}, g_aidx{-1};
+static AVRational g_vtb{1, 1000}, g_atb{1, 1000};
+static int64_t g_durationMs = 0;
+static double g_startTime = 0; // início do arquivo (s)
+
+static Thread g_openThread, g_readThread, g_videoThread, g_audioThread;
+
+// busca
+static std::mutex g_seekMtx;
+static bool g_seekReq = false;
+static int64_t g_seekTargetMs = 0;
+static std::atomic<int64_t> g_seekShowMs{-1}; // posição exibida enquanto busca
+
+// relógio
+static std::mutex g_clockMtx;
+static double g_clockPts = 0;        // segundos
+static uint64_t g_clockAt = 0;       // ticks em que g_clockPts foi medido
+static bool g_clockReady = false;
+static int g_clockSerial = -1;
+
+// saída de vídeo (ARGB na resolução da tela)
+static std::vector<uint32_t> g_frame;
+static int g_frameW = 0, g_frameH = 0;
+static std::atomic<bool> g_hasFrame{false};
+static SwsContext* g_sws = nullptr;
+static int g_lastSrcW = 0, g_lastSrcH = 0, g_lastSrcFmt = -1;
+static int g_dx = 0, g_dy = 0, g_dw = 0, g_dh = 0;
+
+static void setError(const std::string& e)
+{
+    std::lock_guard<std::mutex> lk(g_errMtx);
+    if (g_error.empty()) g_error = e;
+    g_state = (int)State::Error;
+    platform::log("Player erro: %s", e.c_str());
 }
 
-static void freeTextureCb(void*, void* mem)
+static std::string averr(int e)
 {
-    std::lock_guard<std::mutex> lk(g_texMtx);
-    auto it = g_textures.find(mem);
-    if (it == g_textures.end()) return;
-    sceKernelMunmap(mem, it->second.size);
-    sceKernelReleaseDirectMemory(it->second.phys, it->second.size);
-    g_textures.erase(it);
+    char b[128];
+    av_strerror(e, b, sizeof(b));
+    return b;
 }
 
-static void eventCb(void*, int32_t eventId, int32_t, void* data)
+// ---------------------------------------------------------------------------
+// E/S HTTP para o FFmpeg (usa sceHttp; suporta Range para avançar/voltar)
+// ---------------------------------------------------------------------------
+struct HttpIO {
+    std::string url;
+    http::Stream st;
+    int64_t pos = 0;
+    int64_t size = -1;
+    bool seekable = false;
+};
+
+static std::mutex g_ioMtx;
+static std::vector<HttpIO*> g_ios;
+
+static int ioRead(void* opaque, uint8_t* buf, int size)
 {
-    switch (eventId) {
-    case SCE_AVPLAYER_STATE_READY:
-        platform::log("AvPlayer READY");
-        break;
-    case SCE_AVPLAYER_STATE_PLAY:
-        g_everPlayed = true;
-        g_state = (int)State::Playing;
-        break;
-    case SCE_AVPLAYER_STATE_PAUSE:
-        g_state = (int)State::Paused;
-        break;
-    case SCE_AVPLAYER_STATE_BUFFERING:
-        if (g_state != (int)State::Paused) g_state = (int)State::Buffering;
-        break;
-    case SCE_AVPLAYER_STATE_STOP:
-        g_state = g_everPlayed ? (int)State::Ended : (int)State::Error;
-        if (!g_everPlayed) {
-            std::lock_guard<std::mutex> lk(g_mtx);
-            if (g_error.empty()) g_error = "Não foi possível abrir o vídeo (formato ou link não suportado).";
+    HttpIO* io = (HttpIO*)opaque;
+    if (g_stop) return AVERROR_EXIT;
+    if (io->size >= 0 && io->pos >= io->size) return AVERROR_EOF;
+    // pequeno salto para frente na mesma conexão: lê e descarta em vez de reabrir
+    if (io->st.open && io->pos > (int64_t)io->st.pos && io->pos - (int64_t)io->st.pos < (1 << 20)) {
+        uint8_t tmp[16384];
+        while ((int64_t)io->st.pos < io->pos) {
+            uint32_t want = (uint32_t)std::min<int64_t>((int64_t)sizeof(tmp), io->pos - (int64_t)io->st.pos);
+            if (http::streamRead(io->st, tmp, want) <= 0) { http::streamClose(io->st); break; }
         }
-        break;
-    case SCE_AVPLAYER_WARNING_ID: {
-        int32_t code = data ? *(int32_t*)data : 0;
-        platform::log("AvPlayer warning 0x%08X", code);
-        break;
     }
-    case SCE_AVPLAYER_DRM_ERROR:
-    case SCE_AVPLAYER_ENCRYPTION: {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        g_error = "Conteúdo protegido/criptografado não suportado.";
-        g_state = (int)State::Error;
-        break;
+    if (!io->st.open || (int64_t)io->st.pos != io->pos) {
+        if (!http::streamOpen(io->st, io->url, (uint64_t)io->pos)) return g_stop ? AVERROR_EXIT : AVERROR(EIO);
     }
-    default: break;
+    int n = http::streamRead(io->st, buf, (uint32_t)size);
+    if (n < 0) {
+        http::streamClose(io->st);
+        return g_stop ? AVERROR_EXIT : AVERROR(EIO);
     }
+    if (n == 0) return AVERROR_EOF;
+    io->pos += n;
+    return n;
 }
 
-// --------------------------------------------------------------------------
-// Áudio: lê PCM s16 do AvPlayer, converte para estéreo 48 kHz e envia ao AudioOut
-// --------------------------------------------------------------------------
-static void audioLoop()
+static int64_t ioSeek(void* opaque, int64_t offset, int whence)
 {
-    const int kGrain = 1024; // amostras por canal por saída
-    int port = -1;
-    std::vector<int16_t> pending;  // estéreo intercalado, 48 kHz
-    pending.reserve(kGrain * 8);
-    double resamplePos = 0.0;
-    int16_t lastL = 0, lastR = 0;
+    HttpIO* io = (HttpIO*)opaque;
+    whence &= ~AVSEEK_FORCE;
+    if (whence == AVSEEK_SIZE) return io->size;
+    if (!io->seekable) return AVERROR(ENOSYS);
+    int64_t np;
+    if (whence == SEEK_SET) np = offset;
+    else if (whence == SEEK_CUR) np = io->pos + offset;
+    else if (whence == SEEK_END) np = io->size + offset;
+    else return AVERROR(EINVAL);
+    if (np < 0) return AVERROR(EINVAL);
+    io->pos = np;
+    return np;
+}
 
-    while (g_audioRun) {
-        SceAvPlayerFrameInfo fi;
-        memset(&fi, 0, sizeof(fi));
-        bool got = g_h && sceAvPlayerGetAudioData(g_h, &fi);
-        if (!got || !fi.pData) {
-            platform::sleepMs(4);
+static AVIOContext* ioOpen(const std::string& url)
+{
+    HttpIO* io = new HttpIO();
+    io->url = url;
+    {
+        std::lock_guard<std::mutex> lk(g_ioMtx);
+        g_ios.push_back(io); // registrado antes de conectar, para poder abortar
+    }
+    auto unregister = [io] {
+        std::lock_guard<std::mutex> lk(g_ioMtx);
+        for (size_t i = 0; i < g_ios.size(); i++)
+            if (g_ios[i] == io) { g_ios.erase(g_ios.begin() + (long)i); break; }
+    };
+    if (g_stop || !http::streamOpen(io->st, url, 0)) {
+        unregister();
+        http::streamClose(io->st);
+        delete io;
+        return nullptr;
+    }
+    io->size = io->st.total ? (int64_t)io->st.total : -1;
+    io->seekable = io->st.rangeOk && io->size > 0;
+    const int bufSize = 256 * 1024;
+    uint8_t* buf = (uint8_t*)av_malloc(bufSize);
+    AVIOContext* pb = avio_alloc_context(buf, bufSize, 0, io, ioRead, nullptr, ioSeek);
+    if (!pb) {
+        av_free(buf);
+        unregister();
+        http::streamClose(io->st);
+        delete io;
+        return nullptr;
+    }
+    pb->seekable = io->seekable ? AVIO_SEEKABLE_NORMAL : 0;
+    platform::log("IO aberto: tamanho=%lld seekable=%d", (long long)io->size, io->seekable ? 1 : 0);
+    return pb;
+}
+
+static void ioFree(AVIOContext* pb)
+{
+    if (!pb) return;
+    HttpIO* io = (HttpIO*)pb->opaque;
+    if (io) {
+        {
+            std::lock_guard<std::mutex> lk(g_ioMtx);
+            for (size_t i = 0; i < g_ios.size(); i++)
+                if (g_ios[i] == io) { g_ios.erase(g_ios.begin() + (long)i); break; }
+        }
+        http::streamClose(io->st);
+        delete io;
+    }
+    av_freep(&pb->buffer);
+    avio_context_free(&pb);
+}
+
+// HLS e outros formatos abrem URLs adicionais (segmentos) por aqui
+static int ioOpenCb(AVFormatContext*, AVIOContext** pb, const char* url, int, AVDictionary**)
+{
+    AVIOContext* c = ioOpen(url);
+    if (!c) return AVERROR(EIO);
+    *pb = c;
+    return 0;
+}
+
+static int ioCloseCb(AVFormatContext*, AVIOContext* pb)
+{
+    ioFree(pb);
+    return 0;
+}
+
+static int interruptCb(void*) { return g_stop ? 1 : 0; }
+
+static void abortAllIO()
+{
+    std::lock_guard<std::mutex> lk(g_ioMtx);
+    for (auto* io : g_ios) http::streamAbort(io->st);
+}
+
+// ---------------------------------------------------------------------------
+// Filas
+// ---------------------------------------------------------------------------
+struct PktEntry {
+    AVPacket* pkt; // nullptr = fim (esvaziar o decodificador)
+    int serial;
+};
+
+struct PacketQueue {
+    std::deque<PktEntry> q;
+    size_t bytes = 0;
+    std::mutex m;
+    std::condition_variable cv;
+    size_t maxBytes = 16u << 20;
+
+    void push(AVPacket* p, int serial)
+    {
+        std::unique_lock<std::mutex> lk(m);
+        cv.wait(lk, [&] { return g_stop || bytes < maxBytes || q.size() < 8; });
+        if (g_stop) { if (p) av_packet_free(&p); return; }
+        q.push_back({p, serial});
+        if (p) bytes += (size_t)p->size;
+        cv.notify_all();
+    }
+    bool pop(PktEntry& out, int timeoutMs)
+    {
+        std::unique_lock<std::mutex> lk(m);
+        if (!cv.wait_for(lk, std::chrono::milliseconds(timeoutMs), [&] { return g_stop || !q.empty(); })) return false;
+        if (g_stop || q.empty()) return false;
+        out = q.front();
+        q.pop_front();
+        if (out.pkt) bytes -= (size_t)out.pkt->size;
+        cv.notify_all();
+        return true;
+    }
+    void flush()
+    {
+        std::lock_guard<std::mutex> lk(m);
+        for (auto& e : q) if (e.pkt) av_packet_free(&e.pkt);
+        q.clear();
+        bytes = 0;
+        cv.notify_all();
+    }
+    size_t size()
+    {
+        std::lock_guard<std::mutex> lk(m);
+        return q.size();
+    }
+    void wake()
+    {
+        std::lock_guard<std::mutex> lk(m);
+        cv.notify_all();
+    }
+};
+
+struct VFrame {
+    AVFrame* f;
+    double pts;
+    int serial;
+};
+
+static PacketQueue g_vq, g_aq;
+static std::deque<VFrame> g_fq;
+static std::mutex g_fqMtx;
+static std::condition_variable g_fqCv;
+static const size_t kMaxFrames = 4;
+
+static void clearFrames()
+{
+    std::lock_guard<std::mutex> lk(g_fqMtx);
+    for (auto& v : g_fq) av_frame_free(&v.f);
+    g_fq.clear();
+    g_fqCv.notify_all();
+}
+
+// ---------------------------------------------------------------------------
+// Relógio
+// ---------------------------------------------------------------------------
+static void setClock(double pts, int serial)
+{
+    std::lock_guard<std::mutex> lk(g_clockMtx);
+    g_clockPts = pts;
+    g_clockAt = platform::ticksMs();
+    g_clockReady = true;
+    g_clockSerial = serial;
+}
+
+static bool getClock(double& out)
+{
+    std::lock_guard<std::mutex> lk(g_clockMtx);
+    if (!g_clockReady || g_clockSerial != g_serial) return false;
+    double elapsed = g_paused ? 0.0 : (double)(platform::ticksMs() - g_clockAt) / 1000.0;
+    // com áudio, o relógio é atualizado a cada ~21 ms; limita a extrapolação
+    if (g_aidx >= 0 && elapsed > 0.25) elapsed = 0.25;
+    out = g_clockPts + elapsed;
+    return true;
+}
+
+static void resetClock()
+{
+    std::lock_guard<std::mutex> lk(g_clockMtx);
+    g_clockReady = false;
+}
+
+// ---------------------------------------------------------------------------
+// Thread de leitura (demux)
+// ---------------------------------------------------------------------------
+static void readLoop()
+{
+    AVPacket* pkt = av_packet_alloc();
+    while (!g_stop) {
+        bool doSeek = false;
+        int64_t target = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_seekMtx);
+            if (g_seekReq) { doSeek = true; target = g_seekTargetMs; g_seekReq = false; }
+        }
+        if (doSeek) {
+            int64_t ts = target * 1000 + (int64_t)(g_startTime * AV_TIME_BASE);
+            int r = avformat_seek_file(g_fmt, -1, INT64_MIN, ts, INT64_MAX, 0);
+            if (r < 0) platform::log("seek falhou: %s", averr(r).c_str());
+            g_vq.flush();
+            g_aq.flush();
+            g_serial++;
+            clearFrames();
+            resetClock();
+            g_eof = false;
+        }
+
+        if (g_eof) { platform::sleepMs(20); continue; }
+
+        int r = av_read_frame(g_fmt, pkt);
+        if (r < 0) {
+            if (g_stop) break;
+            platform::log("fim da leitura: %s", averr(r).c_str());
+            // esvazia os decodificadores
+            if (g_vidx >= 0) g_vq.push(nullptr, g_serial);
+            if (g_aidx >= 0) g_aq.push(nullptr, g_serial);
+            g_eof = true;
             continue;
         }
-        if (port < 0) {
-            port = sceAudioOutOpen(platform::userId(), ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, kGrain, 48000,
-                                   ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+        if (pkt->stream_index == g_vidx) g_vq.push(av_packet_clone(pkt), g_serial);
+        else if (pkt->stream_index == g_aidx) g_aq.push(av_packet_clone(pkt), g_serial);
+        av_packet_unref(pkt);
+    }
+    av_packet_free(&pkt);
+}
+
+// ---------------------------------------------------------------------------
+// Decodificação de vídeo
+// ---------------------------------------------------------------------------
+static void videoLoop()
+{
+    AVFrame* frame = av_frame_alloc();
+    int serial = -1;
+    while (!g_stop) {
+        PktEntry e;
+        if (!g_vq.pop(e, 50)) continue;
+        if (e.serial != serial) {
+            avcodec_flush_buffers(g_vdec);
+            serial = e.serial;
+        }
+        int r = avcodec_send_packet(g_vdec, e.pkt);
+        if (e.pkt) av_packet_free(&e.pkt);
+        if (r < 0 && r != AVERROR(EAGAIN) && r != AVERROR_EOF) continue;
+        for (;;) {
+            r = avcodec_receive_frame(g_vdec, frame);
+            if (r < 0) break;
+            int64_t ts = frame->best_effort_timestamp;
+            if (ts == AV_NOPTS_VALUE) ts = frame->pts;
+            double pts = ts == AV_NOPTS_VALUE ? 0.0 : (double)ts * av_q2d(g_vtb) - g_startTime;
+            VFrame v{av_frame_alloc(), pts, serial};
+            av_frame_move_ref(v.f, frame);
+            std::unique_lock<std::mutex> lk(g_fqMtx);
+            g_fqCv.wait(lk, [] { return g_stop || g_fq.size() < kMaxFrames; });
+            if (g_stop || serial != g_serial) { av_frame_free(&v.f); continue; }
+            g_fq.push_back(v);
+        }
+    }
+    av_frame_free(&frame);
+}
+
+// ---------------------------------------------------------------------------
+// Decodificação + saída de áudio (S16 estéreo 48 kHz no AudioOut do PS4)
+// ---------------------------------------------------------------------------
+static void audioLoop()
+{
+    const int kGrain = 1024;
+    int port = -1;
+    AVFrame* frame = av_frame_alloc();
+    SwrContext* swr = nullptr;
+    int swrRate = 0, swrFmt = -1, swrCh = 0;
+    std::vector<int16_t> pending;
+    double pendingPts = 0;
+    int serial = -1;
+    std::vector<int16_t> outBuf;
+
+    while (!g_stop) {
+        if (g_paused) { platform::sleepMs(10); continue; }
+
+        // envia o que já está pronto
+        if (pending.size() >= (size_t)kGrain * 2) {
             if (port < 0) {
-                platform::log("sceAudioOutOpen 0x%08X", port);
-                platform::sleepMs(50);
-                continue;
+                port = sceAudioOutOpen(platform::userId(), ORBIS_AUDIO_OUT_PORT_TYPE_MAIN, 0, kGrain, 48000,
+                                       ORBIS_AUDIO_OUT_PARAM_FORMAT_S16_STEREO);
+                if (port < 0) { platform::log("sceAudioOutOpen 0x%08X", port); platform::sleepMs(100); continue; }
             }
-        }
-        int ch = fi.details.audio.channelCount ? fi.details.audio.channelCount : 2;
-        uint32_t rate = fi.details.audio.sampleRate ? fi.details.audio.sampleRate : 48000;
-        const int16_t* src = (const int16_t*)fi.pData;
-        size_t frames = fi.details.audio.size / (sizeof(int16_t) * (size_t)ch);
-
-        // downmix para estéreo
-        auto frameLR = [&](size_t i, int16_t& l, int16_t& r) {
-            const int16_t* f = src + i * (size_t)ch;
-            if (ch == 1) { l = r = f[0]; return; }
-            if (ch == 2) { l = f[0]; r = f[1]; return; }
-            // 5.1/7.1: L R C LFE Ls Rs ...
-            int c = ch > 2 ? f[2] : 0;
-            int ls = ch > 4 ? f[4] : 0, rs = ch > 5 ? f[5] : 0;
-            int L = f[0] + (c * 7 / 10) + (ls * 7 / 10);
-            int R = f[1] + (c * 7 / 10) + (rs * 7 / 10);
-            L = L > 32767 ? 32767 : (L < -32768 ? -32768 : L);
-            R = R > 32767 ? 32767 : (R < -32768 ? -32768 : R);
-            l = (int16_t)L; r = (int16_t)R;
-        };
-
-        if (rate == 48000) {
-            for (size_t i = 0; i < frames; i++) {
-                int16_t l, r;
-                frameLR(i, l, r);
-                pending.push_back(l);
-                pending.push_back(r);
-            }
-        } else {
-            // reamostragem linear simples (ex.: 44.1 kHz -> 48 kHz)
-            double step = (double)rate / 48000.0;
-            while (resamplePos < (double)frames) {
-                size_t i0 = (size_t)resamplePos;
-                double t = resamplePos - (double)i0;
-                int16_t l0, r0, l1, r1;
-                if (i0 == 0 && t < 0) { l0 = lastL; r0 = lastR; } else frameLR(i0, l0, r0);
-                if (i0 + 1 < frames) frameLR(i0 + 1, l1, r1); else { l1 = l0; r1 = r0; }
-                pending.push_back((int16_t)(l0 + (l1 - l0) * t));
-                pending.push_back((int16_t)(r0 + (r1 - r0) * t));
-                resamplePos += step;
-            }
-            resamplePos -= (double)frames;
-            if (frames) frameLR(frames - 1, lastL, lastR);
-        }
-
-        while (pending.size() >= (size_t)kGrain * 2) {
-            sceAudioOutOutput(port, pending.data()); // bloqueia: dá o ritmo do áudio
+            sceAudioOutOutput(port, pending.data()); // bloqueia ~21 ms: dá o ritmo
+            if (serial == g_serial) setClock(pendingPts, serial);
             pending.erase(pending.begin(), pending.begin() + kGrain * 2);
+            pendingPts += (double)kGrain / 48000.0;
+            continue;
+        }
+
+        PktEntry e;
+        if (!g_aq.pop(e, 30)) continue;
+        if (e.serial != serial) {
+            avcodec_flush_buffers(g_adec);
+            serial = e.serial;
+            pending.clear();
+        }
+        int r = avcodec_send_packet(g_adec, e.pkt);
+        if (e.pkt) av_packet_free(&e.pkt);
+        if (r < 0 && r != AVERROR(EAGAIN) && r != AVERROR_EOF) continue;
+        while (avcodec_receive_frame(g_adec, frame) >= 0) {
+            if (serial != g_serial) { av_frame_unref(frame); continue; }
+            int ch = frame->ch_layout.nb_channels;
+            if (!swr || swrRate != frame->sample_rate || swrFmt != frame->format || swrCh != ch) {
+                swr_free(&swr);
+                AVChannelLayout in;
+                memset(&in, 0, sizeof(in));
+                if (frame->ch_layout.order == AV_CHANNEL_ORDER_UNSPEC || ch == 0) av_channel_layout_default(&in, ch ? ch : 2);
+                else av_channel_layout_copy(&in, &frame->ch_layout);
+                AVChannelLayout out = AV_CHANNEL_LAYOUT_STEREO;
+                int ok = swr_alloc_set_opts2(&swr, &out, AV_SAMPLE_FMT_S16, 48000, &in, (AVSampleFormat)frame->format,
+                                             frame->sample_rate, 0, nullptr);
+                av_channel_layout_uninit(&in);
+                if (ok < 0 || swr_init(swr) < 0) {
+                    swr_free(&swr);
+                    av_frame_unref(frame);
+                    continue;
+                }
+                swrRate = frame->sample_rate;
+                swrFmt = frame->format;
+                swrCh = ch;
+            }
+            int64_t ts = frame->best_effort_timestamp;
+            if (ts == AV_NOPTS_VALUE) ts = frame->pts;
+            int maxOut = swr_get_out_samples(swr, frame->nb_samples) + 32;
+            outBuf.resize((size_t)maxOut * 2);
+            uint8_t* outp = (uint8_t*)outBuf.data();
+            int got = swr_convert(swr, &outp, maxOut, (const uint8_t**)frame->extended_data, frame->nb_samples);
+            if (got > 0) {
+                if (pending.empty() && ts != AV_NOPTS_VALUE)
+                    pendingPts = (double)ts * av_q2d(g_atb) - g_startTime;
+                pending.insert(pending.end(), outBuf.begin(), outBuf.begin() + got * 2);
+            }
+            av_frame_unref(frame);
         }
     }
     if (port >= 0) {
         sceAudioOutOutput(port, NULL);
         sceAudioOutClose(port);
     }
+    swr_free(&swr);
+    av_frame_free(&frame);
 }
 
-// --------------------------------------------------------------------------
-
-// Callbacks de "arquivo" do AvPlayer apontando para o RangeFile (HTTP Range)
-// Callbacks de "arquivo" do AvPlayer apontando para o RangeFile (HTTP Range)
-static std::atomic<int> g_reads{0}, g_readFails{0};
-
-// Log interno do AvPlayer: guarda as últimas linhas para mostrar no erro
-static std::mutex g_logMtx;
-static std::vector<std::string> g_avLog;
-static int avLogCb(void*, const char* fmt, va_list args)
+// ---------------------------------------------------------------------------
+// Abertura (roda fora da thread da interface)
+// ---------------------------------------------------------------------------
+static AVCodecContext* openDecoder(int idx, bool video)
 {
-    char buf[256];
-    vsnprintf(buf, sizeof(buf), fmt, args);
-    size_t n = strlen(buf);
-    while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
-    if (!n) return 0;
-    platform::log("AvPlayer: %s", buf);
-    std::lock_guard<std::mutex> lk(g_logMtx);
-    g_avLog.push_back(buf);
-    if (g_avLog.size() > 6) g_avLog.erase(g_avLog.begin());
-    return 0;
-}
-static std::string avLogTail()
-{
-    std::lock_guard<std::mutex> lk(g_logMtx);
-    std::string out;
-    for (auto& l : g_avLog) out += "> " + l.substr(0, 90) + "\n";
-    return out;
-}
-static int32_t fileOpenCb(void*, const char* name)
-{
-    platform::log("AvPlayer abriu arquivo virtual: %s", name ? name : "(null)");
-    return 0;
-}
-static int32_t fileCloseCb(void*) { return 0; }
-static int32_t fileReadCb(void*, uint8_t* buf, uint64_t pos, uint32_t len)
-{
-    g_reads++;
-    int n = g_file ? g_file->read(buf, pos, len) : -1;
-    if (n < 0) g_readFails++;
-    return n;
-}
-static uint64_t fileSizeCb(void*) { return g_file ? g_file->size() : 0; }
-
-static void setError(const std::string& msg)
-{
-    std::lock_guard<std::mutex> lk(g_mtx);
-    g_error = msg;
-    g_state = (int)State::Error;
-}
-
-static bool hasExt(const std::string& url, const char* ext)
-{
-    std::string u = url;
-    size_t q = u.find('?');
-    if (q != std::string::npos) u = u.substr(0, q);
-    size_t n = strlen(ext);
-    return u.size() >= n && u.compare(u.size() - n, n, ext) == 0;
-}
-
-static std::string hex(int v)
-{
-    char b[16];
-    snprintf(b, sizeof(b), "0x%08X", (unsigned)v);
-    return b;
-}
-
-// Identifica o contêiner pelos primeiros bytes
-static std::string detectFormat(const uint8_t* b, int n)
-{
-    if (n >= 8 && memcmp(b + 4, "ftyp", 4) == 0) return "MP4";
-    if (n >= 8 && (memcmp(b + 4, "moov", 4) == 0 || memcmp(b + 4, "mdat", 4) == 0 || memcmp(b + 4, "free", 4) == 0)) return "MP4";
-    if (n >= 4 && b[0] == 0x1A && b[1] == 0x45 && b[2] == 0xDF && b[3] == 0xA3) return "MKV";
-    if (n >= 4 && memcmp(b, "RIFF", 4) == 0) return "AVI";
-    if (n >= 1 && b[0] == 0x47) return "MPEG-TS";
-    if (n >= 7 && memcmp(b, "#EXTM3U", 7) == 0) return "HLS";
-    if (n >= 1 && (b[0] == '<' || b[0] == '{')) return "HTML/erro do servidor";
-    return "desconhecido";
-}
-
-static SceAvPlayerHandle createPlayer(bool withFile)
-{
-    SceAvPlayerInitData init;
-    memset(&init, 0, sizeof(init));
-    init.memoryReplacement.allocate = allocCb;
-    init.memoryReplacement.deallocate = freeCb;
-    init.memoryReplacement.allocateTexture = allocTextureCb;
-    init.memoryReplacement.deallocateTexture = freeTextureCb;
-    init.eventReplacement.eventCallback = eventCb;
-    if (withFile) {
-        init.fileReplacement.open = fileOpenCb;
-        init.fileReplacement.close = fileCloseCb;
-        init.fileReplacement.readOffset = fileReadCb;
-        init.fileReplacement.size = fileSizeCb;
+    AVStream* st = g_fmt->streams[idx];
+    const AVCodec* codec = avcodec_find_decoder(st->codecpar->codec_id);
+    if (!codec) {
+        platform::log("sem decodificador para %s", avcodec_get_name(st->codecpar->codec_id));
+        return nullptr;
     }
-    init.debugLevel = 3; // log completo (vai para /data/UnitVPro/log.txt)
-    init.basePriority = 700;
-    init.numOutputVideoFramebuffers = 2;
-    init.autoStart = true;
-    init.defaultLanguage = "por";
-    return sceAvPlayerInit(&init);
-}
-
-static int postInitHttp(SceAvPlayerHandle h)
-{
-    int httpCtx = 0, sslCtx = 0;
-    http::contexts(httpCtx, sslCtx);
-    SceAvPlayerPostInitData post;
-    memset(&post, 0, sizeof(post));
-    post.httpCtx.httpContextId = (uint32_t)httpCtx;
-    post.httpCtx.sslContextId = (uint32_t)sslCtx;
-    return sceAvPlayerPostInit(h, &post);
-}
-
-static int addSourceEx(SceAvPlayerHandle h, const std::string& name, int type)
-{
-    SceAvPlayerSourceDetails sd;
-    memset(&sd, 0, sizeof(sd));
-    sd.uri.name = name.c_str();
-    sd.uri.length = (uint32_t)name.size();
-    sd.sourceType = type;
-    return sceAvPlayerAddSourceEx(h, 0, &sd);
-}
-
-static void succeed(SceAvPlayerHandle h)
-{
-    g_h = h;
-    g_audioRun = true;
-    g_audioThread = std::thread(audioLoop);
-    g_opening = false;
+    AVCodecContext* c = avcodec_alloc_context3(codec);
+    avcodec_parameters_to_context(c, st->codecpar);
+    c->pkt_timebase = st->time_base;
+    if (video) {
+        c->thread_count = 6;
+        c->thread_type = FF_THREAD_FRAME | FF_THREAD_SLICE;
+        c->flags2 |= AV_CODEC_FLAG2_FAST;
+        // 1080p ou mais em CPU: pula o deblocking dos quadros não-referência (mais leve)
+        if (st->codecpar->height >= 1000) c->skip_loop_filter = AVDISCARD_NONREF;
+    }
+    int r = avcodec_open2(c, codec, nullptr);
+    if (r < 0) {
+        platform::log("avcodec_open2: %s", averr(r).c_str());
+        avcodec_free_context(&c);
+        return nullptr;
+    }
+    platform::log("%s: %s %dx%d", video ? "video" : "audio", codec->name, c->width, c->height);
+    return c;
 }
 
 static void openWorker(std::string url)
 {
-    std::string diag;
-    {
-        std::lock_guard<std::mutex> lk(g_logMtx);
-        g_avLog.clear();
-    }
-    sceAvPlayerSetLogCallback(avLogCb, nullptr);
-    auto note = [&](const std::string& line) {
-        platform::log("%s", line.c_str());
-        diag += line + "\n";
-    };
-    bool hls = hasExt(url, ".m3u8");
-    note(std::string("Link: ") + (hls ? "HLS (.m3u8)" : (hasExt(url, ".ts") ? "MPEG-TS (.ts)" : "arquivo")));
-
-    // Usa sempre o link original: os links de redirecionamento do Xtream têm token de uso único
-    const std::string& finalUrl = url;
-
-    if (!hls && !hasExt(url, ".ts")) {
-        // ---- Filme/episódio: o app baixa por faixas e entrega ao AvPlayer como arquivo
-        g_file.reset(new http::RangeFile());
-        if (!g_file->open(finalUrl)) {
-            g_file.reset();
-            note("Conexão HTTP com o vídeo falhou: " + http::lastStreamError());
-            setError("Não foi possível conectar ao vídeo.\n\n" + diag);
-            g_opening = false;
-            return;
-        }
-        uint8_t head[16] = {0};
-        int n = g_file->read(head, 0, sizeof(head));
-        std::string fmt = detectFormat(head, n);
-        char sz[64];
-        snprintf(sz, sizeof(sz), "%.1f MB", (double)g_file->size() / (1024.0 * 1024.0));
-        note("Formato: " + fmt + "  |  Tamanho: " + sz);
-
-        g_reads = 0;
-        g_readFails = 0;
-        SceAvPlayerHandle h = createPlayer(true);
-        if (h) {
-            int r = sceAvPlayerAddSource(h, "/app0/stream.mp4");
-            if (r >= 0) { succeed(h); return; }
-            note("Modo arquivo (AddSource): " + hex(r) + "  leituras " + std::to_string(g_reads.load()) +
-                 " / falhas " + std::to_string(g_readFails.load()));
-            r = addSourceEx(h, "/app0/stream.mp4", SCE_AVPLAYER_SOURCE_TYPE_FILE_MP4);
-            if (r >= 0) { succeed(h); return; }
-            note("Modo arquivo (AddSourceEx): " + hex(r));
-            sceAvPlayerClose(h);
-        } else {
-            note("sceAvPlayerInit falhou (modo arquivo)");
-        }
-        g_file.reset();
-
-        // tentativa final: o próprio AvPlayer baixa a URL
-        h = createPlayer(false);
-        if (h) {
-            note("PostInit: " + hex(postInitHttp(h)));
-            int r = sceAvPlayerAddSource(h, finalUrl.c_str());
-            if (r >= 0) { succeed(h); return; }
-            note("Modo URL: " + hex(r));
-            sceAvPlayerClose(h);
-        }
-        std::string msg = "O player do PS4 não conseguiu abrir este vídeo.";
-        if (fmt == "MKV" || fmt == "AVI")
-            msg += "\nO arquivo está em " + fmt + ", formato que o player do PS4 não reproduz (só MP4 e HLS).";
-        setError(msg + "\n\n" + diag + avLogTail());
-        g_opening = false;
+    g_mainIO = ioOpen(url);
+    if (!g_mainIO) {
+        if (!g_stop) setError("Não foi possível conectar ao vídeo (" + http::lastStreamError() + ").");
         return;
     }
+    g_fmt = avformat_alloc_context();
+    g_fmt->pb = g_mainIO;
+    g_fmt->flags |= AVFMT_FLAG_CUSTOM_IO | AVFMT_FLAG_GENPTS;
+    g_fmt->io_open = ioOpenCb;
+    g_fmt->io_close2 = ioCloseCb;
+    g_fmt->interrupt_callback.callback = interruptCb;
+    g_fmt->probesize = 3 * 1024 * 1024;
+    g_fmt->max_analyze_duration = 4 * AV_TIME_BASE;
 
-    // ---- Ao vivo (HLS/TS)
-    http::Response probe = http::get(finalUrl, 64 * 1024, 15);
-    std::string fmt = detectFormat((const uint8_t*)probe.body.data(), (int)probe.body.size());
-    std::string first;
-    for (size_t i = 0; i < probe.body.size() && i < 8; i++) {
-        char b[4];
-        snprintf(b, sizeof(b), "%02X ", (unsigned char)probe.body[i]);
-        first += b;
-    }
-    note("Servidor: HTTP " + std::to_string(probe.status) + "  |  " + fmt + "  |  " +
-         std::to_string(probe.body.size()) + " bytes  [" + first + "]");
-
-    SceAvPlayerHandle h = createPlayer(false);
-    if (!h) {
-        setError("Falha ao iniciar o player do sistema (libSceAvPlayer).");
-        g_opening = false;
+    int r = avformat_open_input(&g_fmt, url.c_str(), nullptr, nullptr);
+    if (r < 0) {
+        g_fmt = nullptr; // avformat_open_input libera o contexto em caso de erro
+        if (!g_stop) setError("Formato não reconhecido (" + averr(r) + ").");
         return;
     }
-    note("PostInit: " + hex(postInitHttp(h)));
-    int r = addSourceEx(h, finalUrl, hls ? SCE_AVPLAYER_SOURCE_TYPE_HLS : SCE_AVPLAYER_SOURCE_TYPE_UNKNOWN);
-    if (r >= 0) { succeed(h); return; }
-    note("AddSourceEx: " + hex(r));
-    r = sceAvPlayerAddSource(h, finalUrl.c_str());
-    if (r >= 0) { succeed(h); return; }
-    note("AddSource: " + hex(r));
-    sceAvPlayerClose(h);
+    r = avformat_find_stream_info(g_fmt, nullptr);
+    if (r < 0 && !g_stop) platform::log("find_stream_info: %s", averr(r).c_str());
+    if (g_stop) return;
 
-    // sem PostInit (player usa a própria pilha HTTP)
-    h = createPlayer(false);
-    if (h) {
-        r = sceAvPlayerAddSource(h, finalUrl.c_str());
-        if (r >= 0) { succeed(h); return; }
-        note("AddSource (sem PostInit): " + hex(r));
-        sceAvPlayerClose(h);
+    int vidx = av_find_best_stream(g_fmt, AVMEDIA_TYPE_VIDEO, -1, -1, nullptr, 0);
+    int aidx = av_find_best_stream(g_fmt, AVMEDIA_TYPE_AUDIO, -1, vidx, nullptr, 0);
+    if (vidx >= 0) {
+        g_vdec = openDecoder(vidx, true);
+        if (!g_vdec) vidx = -1;
+        else g_vtb = g_fmt->streams[vidx]->time_base;
     }
-    setError("O player do PS4 não conseguiu abrir este canal.\n\n" + diag + avLogTail());
-    g_opening = false;
+    if (aidx >= 0) {
+        g_adec = openDecoder(aidx, false);
+        if (!g_adec) aidx = -1;
+        else g_atb = g_fmt->streams[aidx]->time_base;
+    }
+    if (vidx < 0 && aidx < 0) {
+        setError("Nenhuma faixa de vídeo/áudio suportada neste conteúdo.");
+        return;
+    }
+    g_vidx = vidx;
+    g_aidx = aidx;
+    // descarta faixas que não usamos (economiza leitura)
+    for (unsigned i = 0; i < g_fmt->nb_streams; i++)
+        if ((int)i != vidx && (int)i != aidx) g_fmt->streams[i]->discard = AVDISCARD_ALL;
+
+    g_startTime = g_fmt->start_time != AV_NOPTS_VALUE ? (double)g_fmt->start_time / AV_TIME_BASE : 0.0;
+    g_durationMs = g_fmt->duration > 0 ? g_fmt->duration / 1000 : 0;
+    // transmissão ao vivo (sem acesso aleatório): sem duração/busca
+    if (!(g_mainIO->seekable & AVIO_SEEKABLE_NORMAL) && strcmp(g_fmt->iformat->name, "hls") != 0) g_durationMs = 0;
+    platform::log("formato=%s duracao=%lldms", g_fmt->iformat->name, (long long)g_durationMs);
+
+    g_opened = true;
+    g_readThread.start(readLoop);
+    if (vidx >= 0) g_videoThread.start(videoLoop);
+    if (aidx >= 0) g_audioThread.start(audioLoop);
 }
 
+// ---------------------------------------------------------------------------
+// API pública
+// ---------------------------------------------------------------------------
 bool open(const std::string& url)
 {
     close();
     {
-        std::lock_guard<std::mutex> lk(g_mtx);
+        std::lock_guard<std::mutex> lk(g_errMtx);
         g_error.clear();
     }
-    g_everPlayed = false;
-    g_userPaused = false;
+    g_stop = false;
+    g_paused = false;
+    g_eof = false;
     g_hasFrame = false;
-    g_duration = 0;
-
+    g_durationMs = 0;
+    g_seekShowMs = -1;
+    resetClock();
     g_state = (int)State::Opening;
-    g_openedAt = platform::ticksMs();
-    g_opening = true;
-    // A abertura faz rede (pode demorar): roda fora da thread da interface
-    g_openThread = std::thread(openWorker, url);
+    g_active = true;
+    g_openThread.start([url] { openWorker(url); });
     return true;
 }
 
 void close()
 {
-    if (g_openThread.joinable()) g_openThread.join();
-    if (g_audioRun) {
-        g_audioRun = false;
-        if (g_audioThread.joinable()) g_audioThread.join();
+    if (!g_active) return;
+    g_stop = true;
+    abortAllIO();
+    g_vq.wake();
+    g_aq.wake();
+    {
+        std::lock_guard<std::mutex> lk(g_fqMtx);
+        g_fqCv.notify_all();
     }
-    if (g_h) {
-        sceAvPlayerStop(g_h);
-        sceAvPlayerClose(g_h);
-        g_h = nullptr;
-    }
-    g_file.reset();
+    g_openThread.join();
+    g_readThread.join();
+    g_videoThread.join();
+    g_audioThread.join();
+
+    g_vq.flush();
+    g_aq.flush();
+    clearFrames();
+    if (g_vdec) avcodec_free_context(&g_vdec);
+    if (g_adec) avcodec_free_context(&g_adec);
+    if (g_fmt) avformat_close_input(&g_fmt);
+    if (g_mainIO) { ioFree(g_mainIO); g_mainIO = nullptr; }
+    g_vidx = -1;
+    g_aidx = -1;
+    g_opened = false;
+    g_active = false;
     g_hasFrame = false;
     g_state = (int)State::Idle;
 }
 
-bool isOpen() { return g_h != nullptr || g_opening; }
+bool isOpen() { return g_active; }
 
-State state() { return (State)g_state.load(); }
+State state()
+{
+    State s = (State)g_state.load();
+    if (s == State::Error || s == State::Idle) return s;
+    if (!g_opened) return State::Opening;
+    if (g_paused) return State::Paused;
+    size_t fq;
+    {
+        std::lock_guard<std::mutex> lk(g_fqMtx);
+        fq = g_fq.size();
+    }
+    if (g_eof && g_vq.size() == 0 && g_aq.size() == 0 && fq == 0) return State::Ended;
+    if (g_vidx >= 0 && !g_hasFrame) return State::Opening;
+    if (g_vidx >= 0 && fq == 0 && g_vq.size() == 0 && !g_eof) return State::Buffering;
+    return State::Playing;
+}
 
 std::string errorText()
 {
-    std::lock_guard<std::mutex> lk(g_mtx);
+    std::lock_guard<std::mutex> lk(g_errMtx);
     return g_error;
 }
 
-uint64_t positionMs() { return g_h ? sceAvPlayerCurrentTime(g_h) : 0; }
-
-uint64_t durationMs()
+uint64_t positionMs()
 {
-    if (!g_h) return 0;
-    if (g_duration == 0) {
-        int n = sceAvPlayerStreamCount(g_h);
-        for (int i = 0; i < n && i < 8; i++) {
-            SceAvPlayerStreamInfo si;
-            memset(&si, 0, sizeof(si));
-            if (sceAvPlayerGetStreamInfo(g_h, (uint32_t)i, &si) >= 0 && si.duration > g_duration)
-                g_duration = si.duration;
-        }
+    int64_t s = g_seekShowMs;
+    double c;
+    if (getClock(c)) {
+        g_seekShowMs = -1;
+        return c > 0 ? (uint64_t)(c * 1000.0) : 0;
     }
-    return g_duration;
+    return s >= 0 ? (uint64_t)s : 0;
 }
 
-bool hasVideoFrame() { return g_hasFrame; }
+uint64_t durationMs() { return g_durationMs > 0 ? (uint64_t)g_durationMs : 0; }
+
+bool hasVideoFrame() { return g_hasFrame || (g_vidx < 0 && g_opened); }
 
 void pause()
 {
-    if (g_h) { sceAvPlayerPause(g_h); g_userPaused = true; g_state = (int)State::Paused; }
+    if (!g_opened) return;
+    double c;
+    if (getClock(c)) setClock(c, g_serial); // congela o relógio
+    g_paused = true;
 }
 
 void resume()
 {
-    if (g_h) { sceAvPlayerResume(g_h); g_userPaused = false; g_state = (int)State::Playing; }
+    if (!g_opened) return;
+    double c;
+    bool ok = getClock(c);
+    g_paused = false;
+    if (ok) setClock(c, g_serial);
 }
 
 void togglePause()
 {
-    if (state() == State::Paused) resume();
+    if (g_paused) resume();
     else pause();
 }
 
 void seekTo(uint64_t ms)
 {
-    if (g_h) sceAvPlayerJumpToTime(g_h, ms);
+    if (!g_opened || g_durationMs == 0) return;
+    std::lock_guard<std::mutex> lk(g_seekMtx);
+    g_seekReq = true;
+    g_seekTargetMs = (int64_t)ms;
+    g_seekShowMs = (int64_t)ms;
 }
 
-// --------------------------------------------------------------------------
-// Conversão NV12 -> pixels da tela (escala com "letterbox")
-// --------------------------------------------------------------------------
-static inline uint8_t clamp8(int v) { return (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v)); }
-
-static void convertFrame(const uint8_t* base, int pitch, int alignedH, int cropL, int cropT, int visW, int visH,
-                         bool hd, int outW, int outH, uint32_t rs, uint32_t gs, uint32_t bs, uint32_t amask)
+// ---------------------------------------------------------------------------
+// Vídeo -> tela
+// ---------------------------------------------------------------------------
+static void convertFrame(AVFrame* f, SDL_Surface* dst)
 {
-    if (visW <= 0 || visH <= 0) return;
-    if ((int)g_frame.size() != outW * outH) g_frame.assign((size_t)outW * outH, amask);
+    int outW = dst->w, outH = dst->h;
+    if ((int)g_frame.size() != outW * outH) {
+        g_frame.assign((size_t)outW * outH, 0xFF000000u);
+        g_lastSrcW = 0;
+    }
     g_frameW = outW;
     g_frameH = outH;
-
-    // área de destino mantendo proporção
-    int dw = outW, dh = (int)((int64_t)visH * outW / visW);
-    if (dh > outH) { dh = outH; dw = (int)((int64_t)visW * outH / visH); }
-    int dx = (outW - dw) / 2, dy = (outH - dh) / 2;
-
-    // coeficientes (faixa limitada) BT.709 para HD, BT.601 para SD — ponto fixo 16.16
-    int cy = 76309;
-    int crv = hd ? 117489 : 104597, cgu = hd ? 13975 : 25674, cgv = hd ? 34925 : 53278, cbu = hd ? 138438 : 132201;
-
-    static std::vector<int> xmap;
-    xmap.resize((size_t)dw);
-    for (int x = 0; x < dw; x++) xmap[(size_t)x] = cropL + (int)((int64_t)x * visW / dw);
-
-    const uint8_t* yPlane = base;
-    const uint8_t* uvPlane = base + (size_t)pitch * alignedH;
-    static std::vector<uint8_t> yRow, uvRow;
-    yRow.resize((size_t)pitch);
-    uvRow.resize((size_t)pitch);
-    int lastSy = -1, lastSuv = -1;
-
-    // bordas pretas
-    for (int y = 0; y < dy; y++) memset(&g_frame[(size_t)y * outW], 0, (size_t)outW * 4);
-    for (int y = dy + dh; y < outH; y++) memset(&g_frame[(size_t)y * outW], 0, (size_t)outW * 4);
-
-    for (int y = 0; y < dh; y++) {
-        int sy = cropT + (int)((int64_t)y * visH / dh);
-        int suv = sy >> 1;
-        // copia a linha da memória de vídeo (write-combined, leitura lenta) para memória cacheada
-        if (sy != lastSy) { memcpy(yRow.data(), yPlane + (size_t)sy * pitch, (size_t)pitch); lastSy = sy; }
-        if (suv != lastSuv) { memcpy(uvRow.data(), uvPlane + (size_t)suv * pitch, (size_t)pitch); lastSuv = suv; }
-        uint32_t* out = &g_frame[(size_t)(y + dy) * outW];
-        for (int x = 0; x < dx; x++) out[x] = amask;
-        for (int x = dx + dw; x < outW; x++) out[x] = amask;
-        out += dx;
-        const uint8_t* yr = yRow.data();
-        const uint8_t* uvr = uvRow.data();
-        for (int x = 0; x < dw; x++) {
-            int sx = xmap[(size_t)x];
-            int Y = (yr[sx] - 16) * cy;
-            int u = uvr[sx & ~1] - 128;
-            int v = uvr[sx | 1] - 128;
-            uint8_t r = clamp8((Y + crv * v) >> 16);
-            uint8_t g = clamp8((Y - cgu * u - cgv * v) >> 16);
-            uint8_t b = clamp8((Y + cbu * u) >> 16);
-            out[x] = ((uint32_t)r << rs) | ((uint32_t)g << gs) | ((uint32_t)b << bs) | amask;
-        }
+    if (f->width != g_lastSrcW || f->height != g_lastSrcH || f->format != g_lastSrcFmt) {
+        // área de destino respeitando a proporção (inclui pixel não quadrado)
+        AVRational sar = f->sample_aspect_ratio;
+        double ar = (double)f->width / (double)f->height;
+        if (sar.num > 0 && sar.den > 0) ar *= av_q2d(sar);
+        g_dw = outW;
+        g_dh = (int)(outW / ar);
+        if (g_dh > outH) { g_dh = outH; g_dw = (int)(outH * ar); }
+        g_dw &= ~1;
+        g_dh &= ~1;
+        g_dx = (outW - g_dw) / 2;
+        g_dy = (outH - g_dh) / 2;
+        std::fill(g_frame.begin(), g_frame.end(), 0xFF000000u);
+        g_lastSrcW = f->width;
+        g_lastSrcH = f->height;
+        g_lastSrcFmt = f->format;
     }
+    // formato de pixel da superfície: ARGB8888 (memória B,G,R,A) ou ABGR8888 (R,G,B,A)
+    AVPixelFormat outFmt = dst->format->Rmask == 0x000000FF ? AV_PIX_FMT_RGBA : AV_PIX_FMT_BGRA;
+    g_sws = sws_getCachedContext(g_sws, f->width, f->height, (AVPixelFormat)f->format, g_dw, g_dh, outFmt,
+                                 SWS_FAST_BILINEAR, nullptr, nullptr, nullptr);
+    if (!g_sws) return;
+    uint8_t* dstData[4] = {(uint8_t*)&g_frame[(size_t)g_dy * outW + g_dx], nullptr, nullptr, nullptr};
+    int dstLines[4] = {outW * 4, 0, 0, 0};
+    sws_scale(g_sws, f->data, f->linesize, 0, f->height, dstData, dstLines);
     g_hasFrame = true;
-}
-
-static int shiftOf(uint32_t mask)
-{
-    int s = 0;
-    if (!mask) return 0;
-    while (!(mask & 1)) { mask >>= 1; s++; }
-    return s;
 }
 
 void render(SDL_Surface* dst)
 {
     if (!dst) return;
-    if (g_h) {
-        SceAvPlayerFrameInfoEx fi;
-        memset(&fi, 0, sizeof(fi));
-        if (sceAvPlayerGetVideoDataEx(g_h, &fi) && fi.pData) {
-            const SceAvPlayerVideoEx& v = fi.details.video;
-            int pitch = v.pitch ? (int)v.pitch : (int)v.width;
-            int alignedH = (int)v.height;
-            int visW = pitch - (int)v.cropLeftOffset - (int)v.cropRightOffset;
-            int visH = alignedH - (int)v.cropTopOffset - (int)v.cropBottomOffset;
-            if (visW <= 0 || visW > pitch) visW = (int)v.width;
-            if (visH <= 0 || visH > alignedH) visH = alignedH;
-            SDL_PixelFormat* pf = dst->format;
-            convertFrame((const uint8_t*)fi.pData, pitch, alignedH, (int)v.cropLeftOffset, (int)v.cropTopOffset,
-                         visW, visH, visH >= 700, dst->w, dst->h, (uint32_t)shiftOf(pf->Rmask),
-                         (uint32_t)shiftOf(pf->Gmask), (uint32_t)shiftOf(pf->Bmask), pf->Amask);
-            if (g_state == (int)State::Opening || g_state == (int)State::Buffering) {
-                if (!g_userPaused) g_state = (int)State::Playing;
+    AVFrame* show = nullptr;
+    if (g_opened && g_vidx >= 0) {
+        std::lock_guard<std::mutex> lk(g_fqMtx);
+        while (!g_fq.empty()) {
+            VFrame& v = g_fq.front();
+            if (v.serial != g_serial) {
+                av_frame_free(&v.f);
+                g_fq.pop_front();
+                continue;
             }
-            g_everPlayed = true;
+            double clock;
+            bool haveClock = getClock(clock);
+            if (!haveClock) {
+                if (g_aidx < 0) {
+                    // sem áudio: o vídeo dita o relógio
+                    setClock(v.pts, v.serial);
+                    haveClock = getClock(clock);
+                } else {
+                    // aguardando o áudio começar: mostra o primeiro quadro como prévia
+                    if (!g_hasFrame && !show) {
+                        show = v.f;
+                        g_fq.pop_front();
+                    }
+                    break;
+                }
+            }
+            if (!haveClock) break;
+            if (v.pts <= clock + 0.010) {
+                if (show) av_frame_free(&show);
+                show = v.f; // o mais recente cujo horário já chegou
+                g_fq.pop_front();
+                continue;
+            }
+            // salto de timestamp em transmissão sem áudio: realinha o relógio
+            if (v.pts - clock > 3.0 && g_aidx < 0) setClock(v.pts, v.serial);
+            break;
         }
-        if (g_everPlayed && g_state == (int)State::Playing && !sceAvPlayerIsActive(g_h))
-            g_state = (int)State::Ended;
+        g_fqCv.notify_all();
     }
-
-    // tempo limite para abrir
-    if (g_state == (int)State::Opening && !g_opening && platform::ticksMs() - g_openedAt > 40000) {
-        std::lock_guard<std::mutex> lk(g_mtx);
-        g_error = "Tempo esgotado ao conectar ao vídeo.";
-        g_state = (int)State::Error;
+    if (show) {
+        convertFrame(show, dst);
+        av_frame_free(&show);
     }
 
     if (g_hasFrame && g_frameW == dst->w && g_frameH == dst->h) {

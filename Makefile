@@ -8,11 +8,15 @@ TITLE_ID    := UNTV00001
 CONTENT_ID  := IV0000-UNTV00001_00-UNITVPROPS400000
 
 # Libraries linked into the ELF.
-LIBS        := -lc -lkernel -lc++ -lSceUserService -lSceVideoOut -lSceAudioOut -lScePad \
-               -lSceSysmodule -lSceFreeType -lSDL2 -lSceNet -lSceNetCtl -lSceSsl -lSceHttp \
-               -lSceAvPlayer -lSceImeDialog -lSceCommonDialog -lSceSystemService
+# FFmpeg compilado por scripts/build-ffmpeg.sh
+FFMPEG      ?= ffmpeg-ps4
 
-EXTRAFLAGS  := -O2 -Ithird_party -Isrc -Wno-unused-command-line-argument
+LIBS        := -L$(FFMPEG)/lib -lavformat -lavcodec -lswresample -lswscale -lavutil \
+               -lc -lkernel -lc++ -lSceUserService -lSceVideoOut -lSceAudioOut -lScePad \
+               -lSceSysmodule -lSceFreeType -lSDL2 -lSceNet -lSceNetCtl -lSceSsl -lSceHttp \
+               -lSceImeDialog -lSceCommonDialog -lSceSystemService
+
+EXTRAFLAGS  := -O2 -Ithird_party -Isrc -isystem $(FFMPEG)/include -Wno-unused-command-line-argument
 
 # Asset and module directories.
 ASSETS      := $(wildcard assets/fonts/*) $(wildcard assets/images/*)

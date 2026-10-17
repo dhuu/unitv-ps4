@@ -1,4 +1,4 @@
-// Download por faixas (HTTP Range) para alimentar o AvPlayer com arquivos remotos
+// Download por faixas (HTTP Range) usado pelo player (FFmpeg) para ler vídeos remotos
 #include "http.h"
 #include "platform.h"
 
@@ -43,27 +43,31 @@ static uint64_t parseTotal(const char* hdr, size_t len, uint64_t from, int statu
     return 0;
 }
 
-bool streamOpen(Stream& st, const std::string& url, uint64_t from)
+// Abre uma requisição; useRange=false manda GET simples (alguns painéis respondem 400 ao Range)
+static int openRequest(Stream& st, const std::string& url, uint64_t from, bool useRange)
 {
     streamClose(st);
     int httpCtx, sslCtx;
     contexts(httpCtx, sslCtx);
     uint32_t usec = 20u * 1000000u;
     st.tpl = sceHttpCreateTemplate(httpCtx, UA, ORBIS_HTTP_VERSION_1_1, 1);
-    if (st.tpl < 0) return false;
+    if (st.tpl < 0) { g_lastErr = "template"; return -1; }
     sceHttpsSetSslCallback(st.tpl, skipSsl, NULL);
     sceHttpsDisableOption(st.tpl, 0x01);
     sceHttpSetConnectTimeOut(st.tpl, usec);
     sceHttpSetResolveTimeOut(st.tpl, usec);
     ((SetTimeoutFn)(void*)&sceHttpSetRecvTimeOut)(st.tpl, usec);
     st.conn = sceHttpCreateConnectionWithURL(st.tpl, url.c_str(), true);
-    if (st.conn < 0) { streamClose(st); return false; }
+    if (st.conn < 0) { g_lastErr = "conexão"; streamClose(st); return -1; }
     st.req = sceHttpCreateRequestWithURL(st.conn, ORBIS_METHOD_GET, url.c_str(), 0);
-    if (st.req < 0) { streamClose(st); return false; }
-    char range[64];
-    snprintf(range, sizeof(range), "bytes=%llu-", (unsigned long long)from);
-    sceHttpAddRequestHeader(st.req, "Range", range, 0);
+    if (st.req < 0) { g_lastErr = "requisição"; streamClose(st); return -1; }
+    if (useRange) {
+        char range[64];
+        snprintf(range, sizeof(range), "bytes=%llu-", (unsigned long long)from);
+        sceHttpAddRequestHeader(st.req, "Range", range, 0);
+    }
     sceHttpAddRequestHeader(st.req, "Accept", "*/*", 0);
+    sceHttpAddRequestHeader(st.req, "Connection", "keep-alive", 0);
     int ret = sceHttpSendRequest(st.req, NULL, 0);
     if (ret < 0) {
         char e[64];
@@ -71,10 +75,23 @@ bool streamOpen(Stream& st, const std::string& url, uint64_t from)
         g_lastErr = e;
         platform::log("stream send 0x%08X", ret);
         streamClose(st);
-        return false;
+        return -1;
     }
     int32_t status = 0;
     sceHttpGetStatusCode(st.req, &status);
+    return status;
+}
+
+bool streamOpen(Stream& st, const std::string& url, uint64_t from)
+{
+    // do início: GET simples; com deslocamento: tenta Range e, se recusado, GET simples + descarte
+    bool useRange = from > 0;
+    int status = openRequest(st, url, from, useRange);
+    if (useRange && (status == 400 || status == 416 || status == 403)) {
+        platform::log("Range recusado (HTTP %d), tentando sem Range", status);
+        status = openRequest(st, url, from, false);
+    }
+    if (status < 0) return false;
     if (status != 200 && status != 206) {
         g_lastErr = "HTTP " + std::to_string(status);
         platform::log("stream HTTP %d", status);
@@ -83,14 +100,21 @@ bool streamOpen(Stream& st, const std::string& url, uint64_t from)
     }
     char* hdr = nullptr;
     size_t hlen = 0;
-    if (sceHttpGetAllResponseHeaders(st.req, &hdr, &hlen) >= 0) st.total = parseTotal(hdr, hlen, from, status);
+    st.total = 0;
+    st.rangeOk = status == 206;
+    if (sceHttpGetAllResponseHeaders(st.req, &hdr, &hlen) >= 0 && hdr) {
+        st.total = parseTotal(hdr, hlen, from, status);
+        std::string low(hdr, hlen);
+        for (auto& c : low) c = (char)tolower((unsigned char)c);
+        if (low.find("accept-ranges: bytes") != std::string::npos) st.rangeOk = true;
+    }
     st.open = true;
     st.pos = 0;
     if (status == 206 || from == 0) {
         st.pos = from;
     } else {
         // servidor ignorou o Range: descarta bytes até chegar em "from"
-        std::vector<char> skip(64 * 1024);
+        std::vector<char> skip(128 * 1024);
         while (st.pos < from) {
             uint32_t want = (uint32_t)std::min<uint64_t>(skip.size(), from - st.pos);
             int n = sceHttpReadData(st.req, skip.data(), want);
@@ -99,6 +123,12 @@ bool streamOpen(Stream& st, const std::string& url, uint64_t from)
         }
     }
     return true;
+}
+
+void streamAbort(Stream& st)
+{
+    int req = st.req;
+    if (req >= 0) sceHttpAbortRequest(req);
 }
 
 int streamRead(Stream& st, void* buf, uint32_t len)

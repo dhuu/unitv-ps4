@@ -216,11 +216,6 @@ public:
         if (st == player::State::Error && !errorShown_) {
             errorShown_ = true;
             std::string msg = player::errorText();
-            if (cur().ext == "mkv" || cur().ext == "avi")
-                msg += "\n\nObs.: o player do PS4 reproduz MP4 (H.264/AAC) e HLS. Arquivos ." + cur().ext +
-                       " podem não ser suportados.";
-            if (isLive() && storage::settings().liveFormat == "ts")
-                msg += "\n\nDica: em Ajustes, mude o formato da TV ao vivo para HLS (.m3u8).";
             auto alive = alive_;
             app::dialog("Erro na reprodução", msg, {"Tentar novamente", "Voltar"}, [this, alive](int r) {
                 if (!*alive) return;

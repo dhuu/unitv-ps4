@@ -1,6 +1,6 @@
 #pragma once
-// Reprodutor baseado no libSceAvPlayer do PS4 (substitui o Media3/ExoPlayer do Android).
-// Suporta HLS (.m3u8) e MP4 via HTTP/HTTPS. Vídeo NV12 convertido para a tela via CPU.
+// Player interno baseado no FFmpeg (substitui o Media3/ExoPlayer do Android).
+// Toca MPEG-TS, HLS, MP4, MKV, AVI... (H.264, HEVC, MPEG-2, AAC, AC3, MP3...) via HTTP/HTTPS.
 #include <string>
 #include <cstdint>
 #include <SDL2/SDL.h>

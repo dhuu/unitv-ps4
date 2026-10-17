@@ -21,7 +21,7 @@ struct Settings {
     std::vector<std::string> dnsList;
     std::string user, pass;
     std::string parentalPin = "0000";
-    std::string liveFormat = "m3u8"; // "m3u8" (HLS, recomendado no PS4) ou "ts"
+    std::string liveFormat = "ts";   // "ts" (MPEG-TS, como no Android) ou "m3u8" (HLS)
     bool loggedIn = false;
 };
 

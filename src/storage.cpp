@@ -56,7 +56,7 @@ void load()
     s.user = j["user"].str();
     s.pass = j["pass"].str();
     s.parentalPin = j["parentalPin"].str("0000");
-    s.liveFormat = j["liveFormat"].str("m3u8");
+    s.liveFormat = j["liveFormat"].str("ts");
     s.loggedIn = j["loggedIn"].boolean(false);
     s.dnsList.clear();
     for (auto& d : j["dnsList"].items()) s.dnsList.push_back(d.str());

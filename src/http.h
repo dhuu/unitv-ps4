@@ -31,14 +31,17 @@ struct Stream {
     int tpl = -1, conn = -1, req = -1;
     uint64_t pos = 0;     // próximo byte que será lido
     uint64_t total = 0;   // tamanho total do arquivo (0 = desconhecido)
+    bool rangeOk = false; // servidor aceita Range (permite avançar/voltar)
     bool open = false;
 };
 bool streamOpen(Stream& st, const std::string& url, uint64_t from);
 std::string lastStreamError(); // diagnóstico da última falha de streamOpen
 int streamRead(Stream& st, void* buf, uint32_t len); // bytes lidos, 0 = fim, <0 = erro
 void streamClose(Stream& st);
+// Interrompe uma leitura bloqueada em outra thread (ao fechar o player)
+void streamAbort(Stream& st);
 
-// Arquivo remoto com acesso aleatório (para o AvPlayer ler MP4 como se fosse local).
+// Arquivo remoto com acesso aleatório e cache de blocos.
 // Usa blocos em cache e reaproveita a conexão quando a leitura é sequencial.
 class RangeFile {
 public:
