@@ -8,6 +8,8 @@
 
 #include <cmath>
 
+#include <orbis/SystemService.h>
+
 namespace app {
 
 static std::vector<std::unique_ptr<Screen>> g_stack;
@@ -176,6 +178,13 @@ void run()
 
         gfx::endFrame();
         g_graveyard.clear();
+
+        // O PS4 mantém a splash do sistema (pic1.png) por cima do app até ela ser escondida
+        static bool splashHidden = false;
+        if (!splashHidden) {
+            splashHidden = true;
+            sceSystemServiceHideSplashScreen();
+        }
 
         // limita a ~60 fps (o flip do SDL pode não esperar o vsync)
         uint64_t spent = platform::ticksMs() - frameStart;
